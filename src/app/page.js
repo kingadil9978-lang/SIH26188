@@ -66,6 +66,13 @@ const references = [
   ['Hyperledger', 'Fabric documentation — a permissioned distributed ledger suited to known, governed participants.'],
   ['SIH 2026', 'Provided idea template — structure, slide limits and submission pointers this concept follows.'],
 ];
+const ALLOWED_FILE_TYPES = [
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+];
+
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 
 const reasonPool = [
   'font_kerning_mismatch',
@@ -93,6 +100,8 @@ export default function Home() {
   const [statusMessage, setStatusMessage] = useState('Connecting to Supabase…');
   const [ledger, setLedger] = useState([]);
   const [running, setRunning] = useState(false);
+  const [selectedFile, setSelectedFile] = useState(null);
+const [uploadError, setUploadError] = useState('');
   const [ledgerError, setLedgerError] = useState('');
 
   const configReady = useMemo(
@@ -281,7 +290,40 @@ export default function Home() {
     setLedgerError('');
     setLedger(data ?? []);
   }
+async function uploadSelectedDocument() {
+  if (!supabase) {
+    setUploadError('Supabase is not connected yet.');
+    return false;
+  }
 
+  if (!selectedFile) {
+    setUploadError('Please select a PDF, JPG or PNG document first.');
+    return false;
+  }
+
+  setUploadError('');
+
+  const safeName = selectedFile.name
+    .replace(/[^a-zA-Z0-9._-]/g, '_');
+
+  const filePath = `uploads/${Date.now()}-${safeName}`;
+
+  const { error } = await supabase.storage
+    .from('document')
+    .upload(filePath, selectedFile, {
+      cacheControl: '3600',
+      upsert: false,
+      contentType: selectedFile.type,
+    });
+
+  if (error) {
+    console.error('Document upload failed:', error);
+    setUploadError(`Upload failed: ${error.message}`);
+    return false;
+  }
+
+  return true;
+}
   async function runSpecimenCheck() {
     if (!supabase) {
       setLedgerError(
@@ -293,6 +335,12 @@ export default function Home() {
 
     setRunning(true);
     setLedgerError('');
+    const uploaded = await uploadSelectedDocument();
+
+if (!uploaded) {
+  setRunning(false);
+  return;
+}
 
     try {
       const riskScore =
@@ -1180,7 +1228,58 @@ export default function Home() {
         </div>
 
         <div className="reveal">
+<div className="upload-panel">
+  <div className="upload-title">
+    Upload a document for verification
+  </div>
 
+  <p className="upload-description">
+    Accepted formats: PDF, JPG and PNG. Maximum size: 10 MB.
+  </p>
+
+  <input
+    type="file"
+    accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
+    onChange={(event) => {
+      const file = event.target.files?.[0];
+
+      setUploadError('');
+      setSelectedFile(null);
+
+      if (!file) return;
+
+      if (!ALLOWED_FILE_TYPES.includes(file.type)) {
+        setUploadError(
+          'Unsupported file type. Please upload a PDF, JPG or PNG file.'
+        );
+        event.target.value = '';
+        return;
+      }
+
+      if (file.size > MAX_FILE_SIZE) {
+        setUploadError(
+          'File is too large. Maximum allowed size is 10 MB.'
+        );
+        event.target.value = '';
+        return;
+      }
+
+      setSelectedFile(file);
+    }}
+  />
+
+  {selectedFile && (
+    <div className="selected-file">
+      Selected: <strong>{selectedFile.name}</strong>
+    </div>
+  )}
+
+  {uploadError && (
+    <div className="ledger-error">
+      <strong>Upload:</strong> {uploadError}
+    </div>
+  )}
+</div>
           <div className="ledger-head">
 
             <div
