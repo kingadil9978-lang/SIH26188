@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
+import Tesseract from 'tesseract.js';
+import { createWorker } from 'tesseract.js';
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -290,6 +292,119 @@ const [uploadError, setUploadError] = useState('');
     setLedgerError('');
     setLedger(data ?? []);
   }
+  async function analyzeDocument(file) {
+  if (!file) {
+    return {
+      isIdentityDocument: false,
+      docType: 'unknown',
+      confidence: 0,
+      reason: 'No document selected',
+    };
+  }
+
+  if (file.type === 'application/pdf') {
+    return {
+      isIdentityDocument: false,
+      docType: 'pdf_document',
+      confidence: 0,
+      reason: 'PDF analysis will be added later',
+    };
+  }
+
+  try {
+    const worker = await Tesseract.createWorker('eng');
+
+    const result = await worker.recognize(file);
+
+    const text = (result.data.text || '').toUpperCase();
+
+    await worker.terminate();
+
+    console.log('OCR text:', text);
+
+    const keywords = [
+      'IDENTITY',
+      'IDENTIFICATION',
+      'AADHAAR',
+      'AADHAR',
+      'PASSPORT',
+      'DRIVING',
+      'LICENSE',
+      'LICENCE',
+      'NATIONAL ID',
+      'DATE OF BIRTH',
+      'DOB',
+      'UIDAI',
+    ];
+
+    const matches = keywords.filter((word) =>
+      text.includes(word)
+    );
+
+    const hasAadhaarNumber =
+      /\b\d{4}\s?\d{4}\s?\d{4}\b/.test(text);
+
+    const hasDateOfBirth =
+      /\b\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}\b/.test(text);
+
+    let confidence = 0;
+
+    confidence += Math.min(matches.length * 15, 60);
+
+    if (hasAadhaarNumber) {
+      confidence += 25;
+    }
+
+    if (hasDateOfBirth) {
+      confidence += 15;
+    }
+
+    confidence = Math.min(confidence, 100);
+
+    const isIdentityDocument = confidence >= 35;
+
+    let docType = 'unknown';
+
+    if (isIdentityDocument) {
+      if (
+        text.includes('AADHAAR') ||
+        text.includes('AADHAR') ||
+        text.includes('UIDAI') ||
+        hasAadhaarNumber
+      ) {
+        docType = 'aadhaar';
+      } else if (text.includes('PASSPORT')) {
+        docType = 'passport';
+      } else if (
+        text.includes('DRIVING') ||
+        text.includes('LICENSE') ||
+        text.includes('LICENCE')
+      ) {
+        docType = 'driving_license';
+      } else {
+        docType = 'national_id';
+      }
+    }
+
+    return {
+      isIdentityDocument,
+      docType,
+      confidence,
+      reason: isIdentityDocument
+        ? 'Identity document indicators detected'
+        : 'No identity document detected',
+    };
+  } catch (error) {
+    console.error('OCR failed:', error);
+
+    return {
+      isIdentityDocument: false,
+      docType: 'unknown',
+      confidence: 0,
+      reason: 'Unable to analyze image',
+    };
+  }
+}
 async function uploadSelectedDocument() {
   if (!supabase) {
     setUploadError('Supabase is not connected yet.');
@@ -343,86 +458,181 @@ if (!uploaded) {
 }
 
     try {
-      const riskScore =
-        Math.floor(Math.random() * 60);
+  // -----------------------------------------
+  // 1. OCR: read the uploaded image
+  // -----------------------------------------
+  let extractedText = '';
 
-      const decision =
-        riskScore > 45
-          ? 'rejected'
-          : riskScore > 20
-            ? 'review'
-            : 'approved';
+  if (
+    selectedFile &&
+    (selectedFile.type === 'image/jpeg' ||
+      selectedFile.type === 'image/png')
+  ) {
+    const worker = await createWorker('eng');
 
-      const reasonCodes =
-        reasonPool.filter(
-          () => Math.random() > 0.5
-        );
+    try {
+      const result = await worker.recognize(selectedFile);
+      extractedText = result.data.text || '';
+    } finally {
+      await worker.terminate();
+    }
+  }
 
-      const docHash =
-        await sha256Hex(
-          `specimen-${Date.now()}-${Math.random()}`
-        );
+  // -----------------------------------------
+  // 2. Normalize OCR text
+  // -----------------------------------------
+  const text = extractedText
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
 
-      const {
-        data: document,
-        error: documentError,
-      } = await supabase
-        .from('documents')
-        .insert({
-          doc_type: 'national_id',
-          status: decision,
-        })
-        .select()
-        .single();
+  console.log('OCR extracted text:', text);
 
-      if (documentError) {
-        throw new Error(
-          `documents insert failed: ${documentError.message}`
-        );
-      }
+  // -----------------------------------------
+  // 3. Check whether this looks like an ID
+  // -----------------------------------------
+  const idKeywords = [
+    'aadhaar',
+    'uidai',
+    'identity',
+    'identity card',
+    'national id',
+    'government of india',
+    'date of birth',
+    'dob',
+    'address',
+    'name',
+  ];
 
-      const {
-        data: event,
-        error: eventError,
-      } = await supabase
-        .from('verification_events')
-        .insert({
-          document_id: document.id,
-          risk_score: riskScore,
-          reason_codes: reasonCodes,
-          decision,
-        })
-        .select()
-        .single();
+  const matchedKeywords = idKeywords.filter(
+    (keyword) => text.includes(keyword)
+  );
 
-      if (eventError) {
-        throw new Error(
-          `verification_events insert failed: ${eventError.message}`
-        );
-      }
+  // Detect a 12-digit Aadhaar-like number
+  const hasIdNumber =
+    /\b\d{4}\s?\d{4}\s?\d{4}\b/.test(text);
 
-      const blockRef =
-        `block#${Math.floor(
-          1000 + Math.random() * 9000
-        )}`;
+  const looksLikeNationalId =
+    hasIdNumber || matchedKeywords.length >= 3;
 
-      const {
-        error: anchorError,
-      } = await supabase
-        .from('ledger_anchors')
-        .insert({
-          verification_event_id: event.id,
-          doc_hash: docHash,
-          block_ref: blockRef,
-        });
+  // -----------------------------------------
+  // 4. Reject documents that don't look like ID
+  // -----------------------------------------
+  let riskScore;
+  let decision;
+  let reasonCodes;
 
-      if (anchorError) {
-        throw new Error(
-          `ledger_anchors insert failed: ${anchorError.message}`
-        );
-      }
+  if (!looksLikeNationalId) {
+    riskScore = 90;
+    decision = 'rejected';
 
-      await refreshLedger();
+    reasonCodes = [
+      'document_type_mismatch',
+      'national_id_not_detected',
+      'insufficient_identity_text',
+    ];
+  } else {
+    // Looks like a national ID
+    riskScore = hasIdNumber ? 10 : 25;
+
+    decision =
+      riskScore > 45
+        ? 'rejected'
+        : riskScore > 20
+          ? 'review'
+          : 'approved';
+
+    reasonCodes =
+      riskScore <= 20
+        ? ['national_id_detected']
+        : [
+            'national_id_detected',
+            'manual_review_recommended',
+          ];
+  }
+
+  // -----------------------------------------
+  // 5. Generate document hash
+  // -----------------------------------------
+  const docHash = await sha256Hex(
+    `specimen-${Date.now()}-${Math.random()}`
+  );
+
+  // -----------------------------------------
+  // 6. Save document
+  // -----------------------------------------
+  const {
+    data: document,
+    error: documentError,
+  } = await supabase
+    .from('documents')
+    .insert({
+      doc_type: looksLikeNationalId
+        ? 'national_id'
+        : 'unknown',
+      status: decision,
+    })
+    .select()
+    .single();
+
+  if (documentError) {
+    throw new Error(
+      `documents insert failed: ${documentError.message}`
+    );
+  }
+
+  // -----------------------------------------
+  // 7. Save verification event
+  // -----------------------------------------
+  const {
+    data: event,
+    error: eventError,
+  } = await supabase
+    .from('verification_events')
+    .insert({
+      document_id: document.id,
+      risk_score: riskScore,
+      reason_codes: reasonCodes,
+      decision,
+    })
+    .select()
+    .single();
+
+  if (eventError) {
+    throw new Error(
+      `verification_events insert failed: ${eventError.message}`
+    );
+  }
+
+  // -----------------------------------------
+  // 8. Create ledger anchor
+  // -----------------------------------------
+  const blockRef =
+    `block#${Math.floor(
+      1000 + Math.random() * 9000
+    )}`;
+
+  const {
+    error: anchorError,
+  } = await supabase
+    .from('ledger_anchors')
+    .insert({
+      verification_event_id: event.id,
+      doc_hash: docHash,
+      block_ref: blockRef,
+    });
+
+  if (anchorError) {
+    throw new Error(
+      `ledger_anchors insert failed: ${anchorError.message}`
+    );
+  }
+
+  // -----------------------------------------
+  // 9. Refresh the ledger
+  // -----------------------------------------
+  await refreshLedger();
+  
     } catch (error) {
       console.error(
         'Specimen check failed:',
