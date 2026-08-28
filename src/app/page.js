@@ -1,14 +1,20 @@
 'use client';
-
-import { useEffect, useMemo, useState } from 'react';
+import 'reflect-metadata';
+import * as xmldsigjs from 'xmldsigjs';
+import { X509Certificate } from '@peculiar/x509';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import { createWorker } from 'tesseract.js';
 import jsQR from 'jsqr';
-import JSZip from 'jszip';
 import { XMLParser } from 'fast-xml-parser';
 import {
   BrowserQRCodeReader,
 } from '@zxing/browser';
+import {
+  BlobReader,
+  ZipReader,
+  TextWriter,
+} from '@zip.js/zip.js';
 const SUPABASE_URL =
   process.env.NEXT_PUBLIC_SUPABASE_URL;
 
@@ -179,67 +185,351 @@ const references = [
 function escapeText(value) {
   return String(value ?? '');
 }
-async function inspectOfflineKycZip(file) {
+
+const UIDAI_CERTIFICATE_PATH = '/uidai_offline_publickey_2026.cer';
+
+function decimalQrPayloadToBytes(value) {
+  const payload = String(value || '').trim();
+  if (!/^\d+$/.test(payload)) {
+    throw new Error('The QR payload is not a UIDAI Secure QR numeric payload.');
+  }
+  let hex = BigInt(payload).toString(16);
+  if (hex.length % 2) hex = `0${hex}`;
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let index = 0; index < bytes.length; index++) {
+    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+async function inflateSecureQrPayload(bytes) {
+  for (const format of ['deflate', 'deflate-raw']) {
+    try {
+      const stream = new Blob([bytes]).stream().pipeThrough(
+        new DecompressionStream(format)
+      );
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    } catch {
+      // Try the other UIDAI payload compression variant.
+    }
+  }
+  throw new Error('Unable to decompress the Secure QR payload.');
+}
+
+async function verifyAadhaarSecureQr(qrData) {
+  if (!qrData) return { status: 'unavailable', verified: false };
+  if (!/^\d+$/.test(String(qrData).trim())) {
+    return {
+      status: 'unsupported',
+      verified: false,
+      reason: 'QR detected, but it is not a UIDAI Secure QR payload.',
+    };
+  }
+
   try {
-    const zip = await JSZip.loadAsync(file);
-
-    const xmlFileName = Object.keys(zip.files).find(
-      (name) =>
-        name.toLowerCase().endsWith('.xml') &&
-        !zip.files[name].dir
+    const signedPayload = await inflateSecureQrPayload(
+      decimalQrPayloadToBytes(qrData)
     );
+    const signatureLength = 256;
+    if (signedPayload.length <= signatureLength) {
+      throw new Error('Secure QR payload is too short to contain a UIDAI signature.');
+    }
 
-    if (!xmlFileName) {
+    const response = await fetch(UIDAI_CERTIFICATE_PATH, { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`Unable to load UIDAI certificate (${response.status}).`);
+    }
+    const certificate = new X509Certificate(await response.arrayBuffer());
+    const content = signedPayload.slice(0, -signatureLength);
+    const signature = signedPayload.slice(-signatureLength);
+    const verified = await crypto.subtle.verify(
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      certificate.publicKey,
+      signature,
+      content
+    );
+    return {
+      status: verified ? 'verified' : 'invalid',
+      verified,
+      reason: verified
+        ? 'UIDAI Secure QR digital signature verified.'
+        : 'The UIDAI Secure QR digital signature did not verify.',
+    };
+  } catch (error) {
+    console.error('UIDAI Secure QR verification failed:', error);
+    return {
+      status: 'invalid',
+      verified: false,
+      reason: error?.message || 'Unable to verify the UIDAI Secure QR signature.',
+    };
+  }
+}
+async function inspectOfflineKycZip(
+  file,
+  shareCode
+) {
+  try {
+    if (
+      !shareCode ||
+      !shareCode.trim()
+    ) {
       return {
         detected: false,
         status: 'invalid',
-        reason: 'No XML file found inside the ZIP.',
+        reason:
+          'Offline e-KYC Share Code is required for ZIP verification.',
+        isIdentityDocument: false,
+        docType: 'unknown',
+        confidence: 0,
+        ocrConfidence: 0,
+        riskScore: 100,
+        decision: 'review',
+        authenticityStatus:
+          'not_verified',
+        reasonCodes: [
+          'offline_kyc_share_code_missing',
+        ],
+        matchedKeywords: [],
+        extractedText: '',
+        anomalyReasons: [],
+      };
+    }
+
+    const zipReader =
+      new ZipReader(
+        new BlobReader(file),
+        {
+          password:
+            shareCode.trim(),
+        }
+      );
+
+    const entries =
+      await zipReader.getEntries();
+
+    const xmlEntry =
+      entries.find(
+        (entry) =>
+          entry.filename
+            .toLowerCase()
+            .endsWith('.xml')
+      );
+
+    if (!xmlEntry) {
+      await zipReader.close();
+
+      return {
+        detected: false,
+        status: 'invalid',
+        reason:
+          'No XML file found inside the Offline e-KYC ZIP.',
+        isIdentityDocument: false,
+        docType: 'unknown',
+        confidence: 0,
+        ocrConfidence: 0,
+        riskScore: 100,
+        decision: 'review',
+        authenticityStatus:
+          'not_verified',
+        reasonCodes: [
+          'offline_kyc_xml_missing',
+        ],
+        matchedKeywords: [],
+        extractedText: '',
+        anomalyReasons: [],
       };
     }
 
     const xmlText =
-      await zip.files[xmlFileName].async('text');
+      await xmlEntry.getData(
+        new TextWriter()
+      );
 
-    const parser = new XMLParser({
-      ignoreAttributes: false,
-    });
+    await zipReader.close();
 
-    const xml = parser.parse(xmlText);
+    /*
+     * Parse the XML while preserving its
+     * original signature markup.
+     */
+    const parser =
+      new XMLParser({
+        ignoreAttributes: false,
+        preserveOrder: false,
+      });
+
+    const xml =
+      parser.parse(xmlText);
+
+    /*
+     * Validate the XML's XMLDSig signature
+     * using the public certificate shipped
+     * with the application.
+     */
+    let signatureVerified = false;
+
+    try {
+      const certificateResponse =
+        await fetch(
+          '/uidai_offline_publickey_2026.cer',
+          {
+            cache: 'no-store',
+          }
+        );
+
+      if (
+        !certificateResponse.ok
+      ) {
+        throw new Error(
+          `Unable to load UIDAI public certificate (${certificateResponse.status}).`
+        );
+      }
+
+      const certificateBuffer =
+        await certificateResponse.arrayBuffer();
+
+      const uidaiCertificate =
+        new X509Certificate(
+          certificateBuffer
+        );
+
+      const publicKey =
+        await uidaiCertificate.publicKey;
+
+      const xmlDocument =
+        xmldsigjs.Parse(
+          xmlText
+        );
+
+      const signatures =
+        xmlDocument.getElementsByTagNameNS(
+          'http://www.w3.org/2000/09/xmldsig#',
+          'Signature'
+        );
+
+      if (
+        !signatures ||
+        signatures.length === 0
+      ) {
+        throw new Error(
+          'No XML digital signature found.'
+        );
+      }
+
+      const signedXml =
+        new xmldsigjs.SignedXml(
+          xmlDocument
+        );
+
+      signedXml.LoadXml(
+        signatures[0]
+      );
+
+      signatureVerified =
+        await signedXml.Verify(
+          publicKey
+        );
+    } catch (
+      signatureError
+    ) {
+      console.error(
+        'UIDAI XML signature verification failed:',
+        signatureError
+      );
+
+      signatureVerified =
+        false;
+    }
+
+    const uidData =
+      xml?.OfflinePaperlessKyc
+        ?.UidData || {};
+
+    const poi =
+      uidData?.Poi || {};
+
+    const poa =
+      uidData?.Poa || {};
+
+    const referenceId =
+      String(
+        xml?.OfflinePaperlessKyc
+          ?.["@_referenceId"] ||
+          ''
+      );
+
+    const reasonCodes = [
+      'offline_kyc_xml_detected',
+    ];
+
+    if (signatureVerified) {
+      reasonCodes.push(
+        'uidai_signature_verified'
+      );
+    } else {
+      reasonCodes.push(
+        'uidai_signature_invalid'
+      );
+    }
+
+    const authenticityStatus =
+      signatureVerified
+        ? 'verified'
+        : 'invalid';
 
     return {
-  detected: true,
-  status: 'present',
-  fileName: xmlFileName,
-  xml,
+      detected: true,
+      status: signatureVerified
+        ? 'verified'
+        : 'invalid',
 
-  isIdentityDocument: true,
-  docType: 'aadhaar',
+      referenceId,
 
-  confidence: 100,
-  ocrConfidence: 0,
+      isIdentityDocument: true,
+      docType: 'aadhaar',
+      confidence: 100,
+      ocrConfidence: 100,
 
-  riskScore: 10,
-  decision: 'review',
+      riskScore: signatureVerified
+        ? 0
+        : 100,
 
-  authenticityStatus:
-    'verification_artifact_present',
+      decision: signatureVerified
+        ? 'approved'
+        : 'rejected',
 
-  reasonCodes: [
-    'offline_kyc_xml_detected',
-    'verification_artifact_present',
-    'cryptographic_signature_still_requires_validation',
-  ],
+      authenticityStatus,
 
-  matchedKeywords: [],
-  extractedText: '',
-  anomalyReasons: [],
+      reasonCodes,
 
-  reason:
-    'UIDAI Offline e-KYC XML found. Cryptographic signature validation is the next step.',
-};
+      matchedKeywords: [
+        'AADHAAR',
+        'UIDAI',
+      ],
+
+      extractedText: [
+        poi?.["@_name"] || '',
+        poi?.["@_dob"] || '',
+        poi?.["@_gender"] || '',
+        poa?.["@_state"] || '',
+        poa?.["@_dist"] || '',
+      ]
+        .filter(Boolean)
+        .join(' '),
+
+      anomalyReasons: signatureVerified
+        ? []
+        : [
+            'uidai_signature_invalid',
+          ],
+
+      reason:
+        signatureVerified
+          ? 'UIDAI Offline e-KYC XML signature verified successfully.'
+          : 'UIDAI Offline e-KYC XML signature could not be verified.',
+    };
   } catch (error) {
     console.error(
-      'Offline e-KYC ZIP inspection failed:',
+      'Offline e-KYC ZIP verification failed:',
       error
     );
 
@@ -248,11 +538,26 @@ async function inspectOfflineKycZip(file) {
       status: 'invalid',
       reason:
         error.message ||
-        'Unable to inspect the ZIP file.',
+        'Unable to verify the Offline e-KYC ZIP.',
+      isIdentityDocument: false,
+      docType: 'unknown',
+      confidence: 0,
+      ocrConfidence: 0,
+      riskScore: 100,
+      decision: 'review',
+      authenticityStatus:
+        'not_verified',
+      reasonCodes: [
+        'offline_kyc_verification_failed',
+      ],
+      matchedKeywords: [],
+      extractedText: '',
+      anomalyReasons: [
+        'offline_kyc_verification_failed',
+      ],
     };
   }
 }
-
 /* -------------------------------------------------------
    SHA-256 OF THE ACTUAL UPLOADED FILE
 ------------------------------------------------------- */
@@ -1129,6 +1434,7 @@ function evaluateScreening({
   ocrConfidence,
   imageSignals,
   qrResult,
+  qrVerification,
   file,
 }) {
   const normalized = String(text || '')
@@ -1782,9 +2088,25 @@ if (
     );
   }
 const authenticityStatus =
-  isIdentityDocument
-    ? 'not_verified'
-    : 'not_available';
+  qrVerification?.status === 'verified'
+    ? 'verified'
+    : qrVerification?.status === 'invalid'
+      ? 'invalid'
+      : isIdentityDocument
+        ? 'not_verified'
+        : 'not_available';
+
+if (qrVerification?.status === 'verified') {
+  reasonCodes.push('uidai_qr_signature_verified');
+  riskScore = 0;
+  decision = 'approved';
+} else if (qrVerification?.status === 'invalid') {
+  reasonCodes.push('uidai_qr_signature_invalid');
+  riskScore = 100;
+  decision = 'rejected';
+} else if (qrDetected) {
+  reasonCodes.push('uidai_qr_signature_not_verified');
+}
   if (
     matchedKeywords.length >
     0
@@ -1855,9 +2177,9 @@ const authenticityStatus =
       'initial_tamper_screen_completed'
     );
 
-    reasonCodes.push(
-      'issuer_authenticity_not_verified'
-    );
+    if (authenticityStatus === 'not_verified') {
+      reasonCodes.push('issuer_authenticity_not_verified');
+    }
   }
 
   return {
@@ -1866,6 +2188,7 @@ const authenticityStatus =
 
   qrDetected,
   qrDataLength,
+  qrVerificationStatus: qrVerification?.status || 'unavailable',
 
   docType,
 
@@ -1895,12 +2218,12 @@ const authenticityStatus =
     anomalyReasons,
 
     reason:
-      !isIdentityDocument
+      qrVerification?.reason || (!isIdentityDocument
         ? 'No sufficient identity-document indicators detected.'
         : decision ===
             'approved'
           ? 'Identity document detected with low initial screening risk.'
-          : 'Identity document detected, but additional review is recommended.',
+          : 'Identity document detected, but additional review is recommended.'),
   };
 }
 async function analyzeImageDocument(
@@ -1916,6 +2239,8 @@ async function analyzeImageDocument(
 
 const qrResult =
   await detectQrCode(image);
+const qrVerification =
+  await verifyAadhaarSecureQr(qrResult?.data);
   const angles = [
   0,
   90,
@@ -1994,6 +2319,7 @@ const worker =
       0,
     imageSignals,
     qrResult,
+    qrVerification,
     file,
   });
 
@@ -2137,15 +2463,15 @@ const pdf =
       );
 
     const result =
-      await analyzeImageDocument(
-        imageFile
-      );
+  await analyzeImageDocument(
+    imageFile
+  );
 
-    pageResults.push({
-      ...result,
-      pdfPage:
-        pageNumber,
-    });
+pageResults.push({
+  ...result,
+  pdfPage:
+    pageNumber,
+});
   }
 
   if (
@@ -2214,8 +2540,10 @@ const pdf =
 ------------------------------------------------------- */
 
 async function analyzeDocument(
-  file
+  file,
+  shareCode
 ) {
+
   if (!file) {
     return {
       isIdentityDocument:
@@ -2251,7 +2579,10 @@ async function analyzeDocument(
     .toLowerCase()
     .endsWith('.zip')
 ) {
-  return await inspectOfflineKycZip(file);
+  return await inspectOfflineKycZip(
+  file,
+  shareCode
+);
 }
     if (
       file.type ===
@@ -2345,6 +2676,13 @@ export default function Home() {
     supabase,
     setSupabase,
   ] = useState(null);
+  const videoRef = useRef(null);
+const canvasRef = useRef(null);
+const cameraStreamRef = useRef(null);
+
+const [cameraOpen, setCameraOpen] = useState(false);
+const [cameraReady, setCameraReady] = useState(false);
+const [cameraError, setCameraError] = useState('');
 
   const [
     status,
@@ -2374,6 +2712,10 @@ export default function Home() {
     selectedFile,
     setSelectedFile,
   ] = useState(null);
+  const [
+  shareCode,
+  setShareCode,
+] = useState('');
 
   const [
     uploadError,
@@ -2803,20 +3145,21 @@ export default function Home() {
     );
 
     try {
-      /*
-       * 1. Analyse the actual document.
-       */
-      const analysis =
-        await analyzeDocument(
-          selectedFile
-        );
+  /*
+   * 1. Analyse the actual document.
+   */
+  const analysis =
+    await analyzeDocument(
+      selectedFile,
+      shareCode
+    );
 
-      /*
-       * Show result immediately.
-       */
-      setAnalysisResult(
-        analysis
-      );
+  /*
+   * Show result immediately.
+   */
+  setAnalysisResult(
+    analysis
+  );
 
       /*
        * 2. Upload file.
@@ -3689,7 +4032,28 @@ export default function Home() {
               PDF, JPG and PNG.
               Maximum size: 10 MB.
             </p>
-
+<input
+  type="password"
+  placeholder="Offline e-KYC Share Code (ZIP only)"
+  value={shareCode}
+  onChange={(event) =>
+    setShareCode(
+      event.target.value
+    )
+  }
+  style={{
+    width: '100%',
+    marginTop: '12px',
+    padding: '12px',
+    borderRadius: '8px',
+    border:
+      '1px solid rgba(255,255,255,0.15)',
+    background:
+      'rgba(255,255,255,0.04)',
+    color: 'inherit',
+    outline: 'none',
+  }}
+/>
             
               <input
   type="file"
@@ -3968,9 +4332,13 @@ export default function Home() {
   </div>
 
   <strong>
-    {analysisResult.qrDetected
-      ? 'Not cryptographically verified'
-      : 'Unavailable'}
+    {analysisResult.qrVerificationStatus === 'verified'
+      ? 'UIDAI signature verified'
+      : analysisResult.qrVerificationStatus === 'invalid'
+        ? 'Invalid signature'
+        : analysisResult.qrDetected
+          ? 'Not verified'
+          : 'Unavailable'}
   </strong>
 </div>
 <div>
@@ -3985,10 +4353,13 @@ export default function Home() {
   </div>
 
   <strong>
-    {analysisResult.authenticityStatus ===
-    'not_verified'
-      ? 'Not verified'
-      : 'Not available'}
+    {analysisResult.authenticityStatus === 'verified'
+      ? 'UIDAI verified'
+      : analysisResult.authenticityStatus === 'invalid'
+        ? 'Invalid'
+        : analysisResult.authenticityStatus === 'not_verified'
+          ? 'Not verified'
+          : 'Not available'}
   </strong>
 </div>
                   {analysisResult.pdfPage && (
@@ -4096,11 +4467,9 @@ export default function Home() {
                       0.65,
                   }}
                 >
-                  Initial screening only:
-                  issuer authenticity is
-                  not cryptographically
-                  verified by this browser
-                  prototype.
+                  OCR and visual checks are screening only. Aadhaar
+                  authenticity is confirmed only when the UIDAI digital
+                  signature reports verified.
                 </p>
               </div>
             )}

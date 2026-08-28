@@ -10,6 +10,7 @@
   "dependencies": {
     "@peculiar/x509": "^2.0.0",
     "@supabase/supabase-js": "^2.112.4",
+    "@zip.js/zip.js": "^2.8.60",
     "@zxing/browser": "^0.2.1",
     "fast-xml-parser": "^5.11.1",
     "jsqr": "^1.4.0",
@@ -19,6 +20,7 @@
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "reflect-metadata": "^0.2.2",
-    "tesseract.js": "^7.0.0"
+    "tesseract.js": "^7.0.0",
+    "xmldsigjs": "^2.8.8"
   }
 }
