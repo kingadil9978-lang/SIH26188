@@ -628,13 +628,35 @@ function createRotatedImage(
         degrees === 90 ||
         degrees === 270;
 
+      const maxOcrDimension = 2200;
+      const resizeScale = Math.min(
+        1,
+        maxOcrDimension /
+          Math.max(
+            image.width,
+            image.height
+          )
+      );
+      const sourceWidth = Math.max(
+        1,
+        Math.round(
+          image.width * resizeScale
+        )
+      );
+      const sourceHeight = Math.max(
+        1,
+        Math.round(
+          image.height * resizeScale
+        )
+      );
+
       canvas.width = swap
-        ? image.height
-        : image.width;
+        ? sourceHeight
+        : sourceWidth;
 
       canvas.height = swap
-        ? image.width
-        : image.height;
+        ? sourceWidth
+        : sourceHeight;
 
       const ctx =
         canvas.getContext('2d');
@@ -660,8 +682,10 @@ function createRotatedImage(
 
       ctx.drawImage(
         image,
-        -image.width / 2,
-        -image.height / 2
+        -sourceWidth / 2,
+        -sourceHeight / 2,
+        sourceWidth,
+        sourceHeight
       );
 
       canvas.toBlob(
@@ -903,7 +927,9 @@ function calculateImageSignals(
 function detectQrCode(image) {
   return new Promise((resolve) => {
     try {
-      const maxDimension = 3000;
+      const maxDimension = 1800;
+      const maxScanDimension = 2200;
+      const maxScanPixels = 3_000_000;
 
       const scale = Math.min(
         1,
@@ -1071,9 +1097,7 @@ function detectQrCode(image) {
 
       const scaleFactors = [
         1,
-        1.5,
-        2,
-        2.5,
+        1.35,
       ];
 
       for (
@@ -1126,23 +1150,40 @@ function detectQrCode(image) {
         for (
           const factor of scaleFactors
         ) {
-          const scanWidth =
-            Math.max(
-              1,
-              Math.round(
-                cropWidth *
-                  factor
-              )
-            );
-
-          const scanHeight =
-            Math.max(
-              1,
-              Math.round(
-                cropHeight *
-                  factor
-              )
-            );
+          const requestedWidth =
+            cropWidth * factor;
+          const requestedHeight =
+            cropHeight * factor;
+          const memoryScale = Math.min(
+            1,
+            maxScanDimension /
+              Math.max(
+                requestedWidth,
+                requestedHeight
+              ),
+            Math.sqrt(
+              maxScanPixels /
+                Math.max(
+                  1,
+                  requestedWidth *
+                    requestedHeight
+                )
+            )
+          );
+          const scanWidth = Math.max(
+            1,
+            Math.round(
+              requestedWidth *
+                memoryScale
+            )
+          );
+          const scanHeight = Math.max(
+            1,
+            Math.round(
+              requestedHeight *
+                memoryScale
+            )
+          );
 
           /*
            * Try three image versions:
@@ -1272,6 +1313,13 @@ function detectQrCode(image) {
   result.data &&
   result.data.trim().length > 0
 ) {
+  scanCanvas.width = 1;
+  scanCanvas.height = 1;
+  cropCanvas.width = 1;
+  cropCanvas.height = 1;
+  sourceCanvas.width = 1;
+  sourceCanvas.height = 1;
+
   resolve({
     detected: true,
     data: result.data,
@@ -1291,6 +1339,13 @@ try {
       ?.trim();
 
   if (zxingPayload) {
+    scanCanvas.width = 1;
+    scanCanvas.height = 1;
+    cropCanvas.width = 1;
+    cropCanvas.height = 1;
+    sourceCanvas.width = 1;
+    sourceCanvas.height = 1;
+
     resolve({
       detected: true,
       data: zxingPayload,
@@ -1302,9 +1357,17 @@ try {
   // No QR found in this scan.
   // Continue with the next crop.
 }
+            scanCanvas.width = 1;
+            scanCanvas.height = 1;
           }
         }
+
+        cropCanvas.width = 1;
+        cropCanvas.height = 1;
       }
+
+      sourceCanvas.width = 1;
+      sourceCanvas.height = 1;
 
       console.log(
         'QR not detected after all scans'
@@ -2336,13 +2399,38 @@ const pdf =
       );
 
     /*
-     * Higher scale gives OCR
-     * more pixels to work with.
+     * Render sharply enough for QR/OCR while keeping the browser tab
+     * below a predictable memory ceiling. A fixed scale of 5 can create
+     * canvases larger than 50 MB per page before OCR even starts.
      */
+    const baseViewport =
+      page.getViewport({
+        scale: 1,
+      });
+    const maxPdfDimension = 2600;
+    const maxPdfPixels = 4_000_000;
+    const renderScale = Math.max(
+      0.5,
+      Math.min(
+        3,
+        maxPdfDimension /
+          Math.max(
+            baseViewport.width,
+            baseViewport.height
+          ),
+        Math.sqrt(
+          maxPdfPixels /
+            Math.max(
+              1,
+              baseViewport.width *
+                baseViewport.height
+            )
+        )
+      )
+    );
     const viewport =
       page.getViewport({
-        /* Preserve small QR modules before the decoder sees the page. */
-        scale: 5,
+        scale: renderScale,
       });
 
     const canvas =
@@ -2366,6 +2454,7 @@ const pdf =
       );
 
     if (!context) {
+      page.cleanup();
       continue;
     }
 
@@ -2407,6 +2496,10 @@ const pdf =
         }
       );
 
+    canvas.width = 1;
+    canvas.height = 1;
+    page.cleanup();
+
     const result =
   await analyzeImageDocument(
     imageFile
@@ -2414,10 +2507,12 @@ const pdf =
 
 pageResults.push({
   ...result,
-  pdfPage:
+pdfPage:
     pageNumber,
 });
   }
+
+  await pdf.destroy();
 
   if (
     pageResults.length === 0
