@@ -2,7 +2,7 @@
 import 'reflect-metadata';
 import * as xmldsigjs from 'xmldsigjs';
 import { X509Certificate } from '@peculiar/x509';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import { createWorker } from 'tesseract.js';
 import jsQR from 'jsqr';
@@ -187,83 +187,6 @@ function escapeText(value) {
 }
 
 const UIDAI_CERTIFICATE_PATH = '/uidai_offline_publickey_2026.cer';
-
-function decimalQrPayloadToBytes(value) {
-  const payload = String(value || '').trim();
-  if (!/^\d+$/.test(payload)) {
-    throw new Error('The QR payload is not a UIDAI Secure QR numeric payload.');
-  }
-  let hex = BigInt(payload).toString(16);
-  if (hex.length % 2) hex = `0${hex}`;
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let index = 0; index < bytes.length; index++) {
-    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
-  }
-  return bytes;
-}
-
-async function inflateSecureQrPayload(bytes) {
-  for (const format of ['deflate', 'deflate-raw']) {
-    try {
-      const stream = new Blob([bytes]).stream().pipeThrough(
-        new DecompressionStream(format)
-      );
-      return new Uint8Array(await new Response(stream).arrayBuffer());
-    } catch {
-      // Try the other UIDAI payload compression variant.
-    }
-  }
-  throw new Error('Unable to decompress the Secure QR payload.');
-}
-
-async function verifyAadhaarSecureQr(qrData) {
-  if (!qrData) return { status: 'unavailable', verified: false };
-  if (!/^\d+$/.test(String(qrData).trim())) {
-    return {
-      status: 'unsupported',
-      verified: false,
-      reason: 'QR detected, but it is not a UIDAI Secure QR payload.',
-    };
-  }
-
-  try {
-    const signedPayload = await inflateSecureQrPayload(
-      decimalQrPayloadToBytes(qrData)
-    );
-    const signatureLength = 256;
-    if (signedPayload.length <= signatureLength) {
-      throw new Error('Secure QR payload is too short to contain a UIDAI signature.');
-    }
-
-    const response = await fetch(UIDAI_CERTIFICATE_PATH, { cache: 'no-store' });
-    if (!response.ok) {
-      throw new Error(`Unable to load UIDAI certificate (${response.status}).`);
-    }
-    const certificate = new X509Certificate(await response.arrayBuffer());
-    const content = signedPayload.slice(0, -signatureLength);
-    const signature = signedPayload.slice(-signatureLength);
-    const verified = await crypto.subtle.verify(
-      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-      certificate.publicKey,
-      signature,
-      content
-    );
-    return {
-      status: verified ? 'verified' : 'invalid',
-      verified,
-      reason: verified
-        ? 'UIDAI Secure QR digital signature verified.'
-        : 'The UIDAI Secure QR digital signature did not verify.',
-    };
-  } catch (error) {
-    console.error('UIDAI Secure QR verification failed:', error);
-    return {
-      status: 'invalid',
-      verified: false,
-      reason: error?.message || 'Unable to verify the UIDAI Secure QR signature.',
-    };
-  }
-}
 async function inspectOfflineKycZip(
   file,
   shareCode
@@ -1441,8 +1364,6 @@ function evaluateScreening({
   text,
   ocrConfidence,
   imageSignals,
-  qrResult,
-  qrVerification,
   file,
 }) {
   const normalized = String(text || '')
@@ -1484,6 +1405,11 @@ function evaluateScreening({
   const matchedKeywords =
     keywords.filter((word) =>
       normalized.includes(word)
+    );
+
+  const fileNameLooksAadhaar =
+    /(?:aadhaar|aadhar|adhaar|adhar)/i.test(
+      file?.name || ''
     );
 
   /*
@@ -1593,6 +1519,14 @@ const aadhaarNumberMismatch =
     detectionScore += 12;
   }
 
+  /*
+   * A filename is only a heuristic, never proof. It is useful for scanned
+   * PDFs where OCR may miss the small Aadhaar heading on the first pass.
+   */
+  if (fileNameLooksAadhaar) {
+    detectionScore += 20;
+  }
+
   detectionScore = Math.min(
     detectionScore,
     100
@@ -1634,6 +1568,10 @@ const aadhaarNumberMismatch =
     (
       hasUIDAIMarker &&
       hasDate
+    ) ||
+    (
+      fileNameLooksAadhaar &&
+      Boolean(imageSignals)
     );
 
   const isPassport =
@@ -1728,13 +1666,6 @@ if (
     'aadhaar_number_mismatch'
   );
 }
-  const qrDetected = Boolean(
-  qrResult?.detected
-);
-
-const qrDataLength =
-  qrResult?.data?.length || 0;
-
   /*
    * Very small image.
    */
@@ -2066,24 +1997,6 @@ if (
   const reasonCodes =
     [];
 
-if (qrDetected) {
-  reasonCodes.push(
-    'qr_code_detected'
-  );
-} else {
-  reasonCodes.push(
-    'qr_code_not_detected'
-  );
-}
-
-if (
-  qrDetected &&
-  qrDataLength > 0
-) {
-  reasonCodes.push(
-    'qr_payload_detected'
-  );
-}
   if (
     isIdentityDocument
   ) {
@@ -2096,25 +2009,9 @@ if (
     );
   }
 const authenticityStatus =
-  qrVerification?.status === 'verified'
-    ? 'verified'
-    : qrVerification?.status === 'invalid'
-      ? 'invalid'
-      : isIdentityDocument
-        ? 'not_verified'
-        : 'not_available';
-
-if (qrVerification?.status === 'verified') {
-  reasonCodes.push('uidai_qr_signature_verified');
-  riskScore = 0;
-  decision = 'approved';
-} else if (qrVerification?.status === 'invalid') {
-  reasonCodes.push('uidai_qr_signature_invalid');
-  riskScore = 100;
-  decision = 'rejected';
-} else if (qrDetected) {
-  reasonCodes.push('uidai_qr_signature_not_verified');
-}
+  isIdentityDocument
+    ? 'pending_face_match'
+    : 'not_available';
   if (
     matchedKeywords.length >
     0
@@ -2158,6 +2055,12 @@ if (qrVerification?.status === 'verified') {
     );
   }
 
+  if (fileNameLooksAadhaar) {
+    reasonCodes.push(
+      'aadhaar_filename_hint'
+    );
+  }
+
   reasonCodes.push(
     `consistency_score_${consistencyScore}`
   );
@@ -2185,18 +2088,14 @@ if (qrVerification?.status === 'verified') {
       'initial_tamper_screen_completed'
     );
 
-    if (authenticityStatus === 'not_verified') {
-      reasonCodes.push('issuer_authenticity_not_verified');
+    if (authenticityStatus === 'pending_face_match') {
+      reasonCodes.push('live_face_match_required');
     }
   }
 
   return {
   isIdentityDocument,
   authenticityStatus,
-
-  qrDetected,
-  qrDataLength,
-  qrVerificationStatus: qrVerification?.status || 'unavailable',
 
   docType,
 
@@ -2226,12 +2125,12 @@ if (qrVerification?.status === 'verified') {
     anomalyReasons,
 
     reason:
-      qrVerification?.reason || (!isIdentityDocument
+      !isIdentityDocument
         ? 'No sufficient identity-document indicators detected.'
         : decision ===
             'approved'
           ? 'Identity document detected with low initial screening risk.'
-          : 'Identity document detected, but additional review is recommended.'),
+          : 'Identity document detected, but additional review is recommended.',
   };
 }
 async function analyzeImageDocument(
@@ -2245,10 +2144,6 @@ async function analyzeImageDocument(
  const imageSignals =
   calculateImageSignals(image);
 
-const qrResult =
-  await detectQrCode(image);
-const qrVerification =
-  await verifyAadhaarSecureQr(qrResult?.data);
   const angles = [
   0,
   90,
@@ -2326,8 +2221,6 @@ const worker =
       bestResult?.confidence ||
       0,
     imageSignals,
-    qrResult,
-    qrVerification,
     file,
   });
 
@@ -2339,6 +2232,7 @@ const worker =
       imageSignals.width,
     imageHeight:
       imageSignals.height,
+    faceSourceFile: file,
   };
 }
 
@@ -2511,8 +2405,6 @@ pdfPage:
     pageNumber,
 });
   }
-
-  await pdf.destroy();
 
   if (
     pageResults.length === 0
@@ -2707,6 +2599,275 @@ async function analyzeDocument(
   }
 }
 
+let faceModelsPromise = null;
+
+async function loadFaceModels() {
+  if (!faceModelsPromise) {
+    faceModelsPromise = import(
+      '@vladmandic/face-api'
+    ).then(async (module) => {
+      const faceapi =
+        module.default?.nets
+          ? module.default
+          : module;
+
+      await Promise.all([
+        faceapi.nets.ssdMobilenetv1.loadFromUri(
+          '/face-models'
+        ),
+        faceapi.nets.faceLandmark68Net.loadFromUri(
+          '/face-models'
+        ),
+        faceapi.nets.faceRecognitionNet.loadFromUri(
+          '/face-models'
+        ),
+      ]);
+
+      return faceapi;
+    });
+  }
+
+  try {
+    return await faceModelsPromise;
+  } catch (error) {
+    faceModelsPromise = null;
+    throw error;
+  }
+}
+
+async function detectFaceDescriptor(
+  faceapi,
+  file,
+  source
+) {
+  const image =
+    await getImageFromFile(file);
+
+  const detections =
+    await faceapi
+      .detectAllFaces(
+        image,
+        new faceapi.SsdMobilenetv1Options({
+          minConfidence:
+            source === 'selfie'
+              ? 0.55
+              : 0.3,
+          maxResults: 6,
+        })
+      )
+      .withFaceLandmarks()
+      .withFaceDescriptors();
+
+  if (detections.length === 0) {
+    throw new Error(
+      source === 'selfie'
+        ? 'No face was detected in the live selfie. Retake it in brighter light and look straight at the camera.'
+        : 'No portrait was detected in the Aadhaar image. Upload a clearer scan with the photo visible.'
+    );
+  }
+
+  if (
+    source === 'selfie' &&
+    detections.length !== 1
+  ) {
+    throw new Error(
+      'More than one face was detected in the selfie. Retake it with only one person in view.'
+    );
+  }
+
+  const largest =
+    [...detections].sort(
+      (left, right) =>
+        right.detection.box.width *
+          right.detection.box.height -
+        left.detection.box.width *
+          left.detection.box.height
+    )[0];
+
+  return {
+    descriptor: largest.descriptor,
+    faceCount: detections.length,
+    detectionConfidence:
+      Math.round(
+        largest.detection.score *
+          100
+      ),
+  };
+}
+
+async function compareDocumentFaceToSelfie(
+  documentFile,
+  selfieFile
+) {
+  const faceapi =
+    await loadFaceModels();
+
+  const [documentFace, selfieFace] =
+    await Promise.all([
+      detectFaceDescriptor(
+        faceapi,
+        documentFile,
+        'document'
+      ),
+      detectFaceDescriptor(
+        faceapi,
+        selfieFile,
+        'selfie'
+      ),
+    ]);
+
+  const distance =
+    faceapi.euclideanDistance(
+      documentFace.descriptor,
+      selfieFace.descriptor
+    );
+
+  /*
+   * Face-API descriptors are commonly compared around a 0.6 distance.
+   * A stricter 0.55 threshold reduces false accepts for this prototype.
+   * The displayed score is an explainable heuristic, not a calibrated
+   * biometric probability.
+   */
+  const matched = distance <= 0.55;
+  const similarityScore =
+    Math.max(
+      0,
+      Math.min(
+        100,
+        Math.round(
+          (1 - distance) * 100
+        )
+      )
+    );
+
+  return {
+    matched,
+    distance,
+    similarityScore,
+    documentFaceCount:
+      documentFace.faceCount,
+    selfieFaceCount:
+      selfieFace.faceCount,
+    documentFaceConfidence:
+      documentFace.detectionConfidence,
+    selfieFaceConfidence:
+      selfieFace.detectionConfidence,
+  };
+}
+
+function applyFaceMatchDecision(
+  analysis,
+  faceMatch
+) {
+  const reasonCodes =
+    (analysis.reasonCodes || [])
+      .filter(
+        (reason) =>
+          reason !==
+          'live_face_match_required'
+      );
+
+  reasonCodes.push(
+    'live_selfie_captured',
+    'document_face_detected',
+    'selfie_face_detected'
+  );
+
+  if (
+    analysis.docType !==
+    'aadhaar'
+  ) {
+    reasonCodes.push(
+      'aadhaar_classification_required'
+    );
+
+    return {
+      ...analysis,
+      faceMatchStatus:
+        'not_evaluated',
+      selfieCaptured: true,
+      authenticityStatus:
+        'review_required',
+      authenticityEvidence:
+        'Live selfie captured; Aadhaar classification was not strong enough for face approval.',
+      decision: 'review',
+      riskScore:
+        Math.max(
+          60,
+          analysis.riskScore
+        ),
+      reasonCodes:
+        Array.from(
+          new Set(reasonCodes)
+        ),
+      reason:
+        'The document must first be identified as Aadhaar before the face comparison can approve it.',
+    };
+  }
+
+  if (faceMatch.matched) {
+    reasonCodes.push(
+      'face_match_passed'
+    );
+
+    return {
+      ...analysis,
+      faceMatchStatus: 'matched',
+      faceSimilarity:
+        faceMatch.similarityScore,
+      faceDistance:
+        Number(
+          faceMatch.distance.toFixed(3)
+        ),
+      selfieCaptured: true,
+      authenticityStatus:
+        'face_match_passed',
+      authenticityEvidence:
+        'Aadhaar portrait matched the live camera capture in the on-device prototype check.',
+      decision: 'approved',
+      riskScore:
+        Math.min(
+          20,
+          analysis.riskScore
+        ),
+      reasonCodes:
+        Array.from(
+          new Set(reasonCodes)
+        ),
+      reason:
+        'Prototype pass: Aadhaar indicators were detected and the document portrait matched the live selfie.',
+    };
+  }
+
+  reasonCodes.push(
+    'face_match_failed'
+  );
+
+  return {
+    ...analysis,
+    faceMatchStatus: 'not_matched',
+    faceSimilarity:
+      faceMatch.similarityScore,
+    faceDistance:
+      Number(
+        faceMatch.distance.toFixed(3)
+      ),
+    selfieCaptured: true,
+    authenticityStatus:
+      'face_match_failed',
+    authenticityEvidence:
+      'The Aadhaar portrait did not match the live camera capture.',
+    decision: 'rejected',
+    riskScore: 100,
+    reasonCodes:
+      Array.from(
+        new Set(reasonCodes)
+      ),
+    reason:
+      'Prototype rejection: the live selfie did not match the Aadhaar portrait closely enough.',
+  };
+}
+
 /* -------------------------------------------------------
    PAGE COMPONENT
 ------------------------------------------------------- */
@@ -2764,6 +2925,35 @@ export default function Home() {
     setAnalysisResult,
   ] = useState(null);
 
+  const videoRef = useRef(null);
+  const cameraStreamRef =
+    useRef(null);
+
+  const [
+    cameraOpen,
+    setCameraOpen,
+  ] = useState(false);
+
+  const [
+    cameraError,
+    setCameraError,
+  ] = useState('');
+
+  const [
+    selfieFile,
+    setSelfieFile,
+  ] = useState(null);
+
+  const [
+    selfiePreview,
+    setSelfiePreview,
+  ] = useState('');
+
+  const [
+    faceModelStatus,
+    setFaceModelStatus,
+  ] = useState('idle');
+
   const configReady =
     useMemo(
       () =>
@@ -2773,6 +2963,36 @@ export default function Home() {
         ),
       []
     );
+
+  useEffect(() => {
+    if (
+      cameraOpen &&
+      videoRef.current &&
+      cameraStreamRef.current
+    ) {
+      videoRef.current.srcObject =
+        cameraStreamRef.current;
+
+      videoRef.current
+        .play()
+        .catch(() => {
+          setCameraError(
+            'The camera opened, but the preview could not start.'
+          );
+        });
+    }
+  }, [cameraOpen]);
+
+  useEffect(
+    () => () => {
+      cameraStreamRef.current
+        ?.getTracks()
+        .forEach((track) =>
+          track.stop()
+        );
+    },
+    []
+  );
 
   /* -----------------------------------------------------
      CONNECT TO SUPABASE
@@ -3081,6 +3301,187 @@ export default function Home() {
      UPLOAD TO STORAGE
   ----------------------------------------------------- */
 
+  function stopCamera() {
+    cameraStreamRef.current
+      ?.getTracks()
+      .forEach((track) =>
+        track.stop()
+      );
+
+    cameraStreamRef.current =
+      null;
+    setCameraOpen(false);
+  }
+
+  function clearSelfie() {
+    stopCamera();
+    setSelfieFile(null);
+    setSelfiePreview(
+      (current) => {
+        if (current) {
+          URL.revokeObjectURL(
+            current
+          );
+        }
+
+        return '';
+      }
+    );
+    setCameraError('');
+    setFaceModelStatus('idle');
+  }
+
+  async function startCamera() {
+    setCameraError('');
+    setAnalysisResult(null);
+
+    if (
+      !navigator.mediaDevices
+        ?.getUserMedia
+    ) {
+      setCameraError(
+        'This browser does not provide camera access. Use a recent Chrome or Edge browser over HTTPS.'
+      );
+      return;
+    }
+
+    try {
+      stopCamera();
+
+      const stream =
+        await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: 'user',
+            width: {
+              ideal: 960,
+            },
+            height: {
+              ideal: 960,
+            },
+          },
+        });
+
+      cameraStreamRef.current =
+        stream;
+      setCameraOpen(true);
+    } catch (error) {
+      setCameraError(
+        error?.name ===
+          'NotAllowedError'
+          ? 'Camera permission was denied. Allow camera access and try again.'
+          : 'Unable to open the camera. Check that another app is not using it.'
+      );
+    }
+  }
+
+  async function captureSelfie() {
+    const video =
+      videoRef.current;
+
+    if (
+      !video ||
+      !video.videoWidth ||
+      !video.videoHeight
+    ) {
+      setCameraError(
+        'The camera is still starting. Wait a moment and try again.'
+      );
+      return;
+    }
+
+    const maxDimension = 900;
+    const scale = Math.min(
+      1,
+      maxDimension /
+        Math.max(
+          video.videoWidth,
+          video.videoHeight
+        )
+    );
+    const canvas =
+      document.createElement(
+        'canvas'
+      );
+
+    canvas.width = Math.max(
+      1,
+      Math.round(
+        video.videoWidth * scale
+      )
+    );
+    canvas.height = Math.max(
+      1,
+      Math.round(
+        video.videoHeight * scale
+      )
+    );
+
+    const context =
+      canvas.getContext('2d');
+
+    if (!context) {
+      setCameraError(
+        'Unable to capture the camera frame.'
+      );
+      return;
+    }
+
+    context.drawImage(
+      video,
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+
+    const blob =
+      await new Promise(
+        (resolve, reject) =>
+          canvas.toBlob(
+            (value) =>
+              value
+                ? resolve(value)
+                : reject(
+                    new Error(
+                      'Unable to create the selfie image.'
+                    )
+                  ),
+            'image/jpeg',
+            0.92
+          )
+      );
+
+    canvas.width = 1;
+    canvas.height = 1;
+
+    const file = new File(
+      [blob],
+      `live-selfie-${Date.now()}.jpg`,
+      {
+        type: 'image/jpeg',
+      }
+    );
+
+    const previewUrl =
+      URL.createObjectURL(file);
+
+    setSelfiePreview(
+      (current) => {
+        if (current) {
+          URL.revokeObjectURL(
+            current
+          );
+        }
+
+        return previewUrl;
+      }
+    );
+    setSelfieFile(file);
+    setCameraError('');
+    stopCamera();
+  }
+
   async function uploadSelectedDocument() {
     if (!supabase) {
       setUploadError(
@@ -3158,6 +3559,14 @@ export default function Home() {
       return;
     }
 
+    if (!selfieFile) {
+      setUploadError(
+        'Capture a live selfie before running the verification.'
+      );
+
+      return;
+    }
+
     if (!selectedFile) {
       setUploadError(
         'Please select a document first.'
@@ -3180,11 +3589,95 @@ export default function Home() {
   /*
    * 1. Analyse the actual document.
    */
-  const analysis =
+  let analysis =
     await analyzeDocument(
       selectedFile,
       shareCode
     );
+
+  if (analysis.faceSourceFile) {
+    setFaceModelStatus(
+      'loading'
+    );
+
+    try {
+      const faceMatch =
+        await compareDocumentFaceToSelfie(
+          analysis.faceSourceFile,
+          selfieFile
+        );
+
+      analysis =
+        applyFaceMatchDecision(
+          analysis,
+          faceMatch
+        );
+
+      setFaceModelStatus(
+        'completed'
+      );
+    } catch (faceError) {
+      analysis = {
+        ...analysis,
+        selfieCaptured: true,
+        faceMatchStatus:
+          'unavailable',
+        authenticityStatus:
+          'review_required',
+        authenticityEvidence:
+          faceError.message ||
+          'Face comparison could not be completed.',
+        decision: 'review',
+        riskScore: Math.max(
+          65,
+          analysis.riskScore
+        ),
+        reasonCodes:
+          Array.from(
+            new Set([
+              ...(analysis.reasonCodes || []),
+              'live_selfie_captured',
+              'face_match_unavailable',
+            ])
+          ),
+        reason:
+          faceError.message ||
+          'Face comparison could not be completed.',
+      };
+
+      setFaceModelStatus(
+        'error'
+      );
+    }
+  } else {
+    analysis = {
+      ...analysis,
+      selfieCaptured: true,
+      faceMatchStatus:
+        'unavailable',
+      authenticityStatus:
+        'review_required',
+      authenticityEvidence:
+        'The uploaded file did not provide a portrait image for comparison.',
+      decision: 'review',
+      riskScore: Math.max(
+        65,
+        analysis.riskScore
+      ),
+      reasonCodes:
+        Array.from(
+          new Set([
+            ...(analysis.reasonCodes || []),
+            'live_selfie_captured',
+            'document_portrait_unavailable',
+          ])
+        ),
+      reason:
+        'The uploaded file did not provide a portrait image for comparison.',
+    };
+
+    setFaceModelStatus('error');
+  }
 
   /*
    * Show result immediately.
@@ -4098,6 +4591,7 @@ export default function Home() {
     setLedgerError('');
     setAnalysisResult(null);
     setSelectedFile(null);
+    clearSelfie();
 
     if (!file) {
       return;
@@ -4156,6 +4650,143 @@ export default function Home() {
                     selectedFile.name
                   }
                 </strong>
+              </div>
+            )}
+
+            {selectedFile && (
+              <div
+                style={{
+                  marginTop: '18px',
+                  padding: '16px',
+                  border:
+                    '1px solid rgba(64, 220, 210, 0.25)',
+                  borderRadius: '10px',
+                  background:
+                    'rgba(64, 220, 210, 0.04)',
+                }}
+              >
+                <div className="upload-title">
+                  Live selfie comparison
+                </div>
+
+                <p className="upload-description">
+                  Capture one clear,
+                  front-facing photo. It is
+                  processed locally in this
+                  browser and is not uploaded
+                  to Supabase.
+                </p>
+
+                {cameraOpen && (
+                  <video
+                    ref={videoRef}
+                    autoPlay
+                    muted
+                    playsInline
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      maxWidth: '440px',
+                      aspectRatio: '4 / 3',
+                      marginTop: '14px',
+                      objectFit: 'cover',
+                      borderRadius: '10px',
+                      transform:
+                        'scaleX(-1)',
+                      background: '#071019',
+                    }}
+                  />
+                )}
+
+                {selfiePreview && (
+                  <img
+                    src={selfiePreview}
+                    alt="Captured live selfie"
+                    style={{
+                      display: 'block',
+                      width: '100%',
+                      maxWidth: '320px',
+                      aspectRatio: '4 / 3',
+                      marginTop: '14px',
+                      objectFit: 'cover',
+                      borderRadius: '10px',
+                      border:
+                        '1px solid rgba(255,255,255,0.14)',
+                    }}
+                  />
+                )}
+
+                <div
+                  style={{
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    gap: '10px',
+                    marginTop: '14px',
+                  }}
+                >
+                  {!cameraOpen &&
+                    !selfieFile && (
+                      <button
+                        type="button"
+                        className="run-btn"
+                        onClick={startCamera}
+                      >
+                        Open camera
+                      </button>
+                    )}
+
+                  {cameraOpen && (
+                    <>
+                      <button
+                        type="button"
+                        className="run-btn"
+                        onClick={captureSelfie}
+                      >
+                        Capture selfie
+                      </button>
+
+                      <button
+                        type="button"
+                        className="run-btn"
+                        onClick={stopCamera}
+                      >
+                        Cancel camera
+                      </button>
+                    </>
+                  )}
+
+                  {selfieFile && (
+                    <button
+                      type="button"
+                      className="run-btn"
+                      onClick={clearSelfie}
+                    >
+                      Retake selfie
+                    </button>
+                  )}
+                </div>
+
+                {selfieFile && (
+                  <p
+                    style={{
+                      marginTop: '10px',
+                      color: '#62e3d9',
+                      fontSize: '12px',
+                    }}
+                  >
+                    Live capture ready for
+                    local face comparison.
+                  </p>
+                )}
+
+                {cameraError && (
+                  <div className="ledger-error">
+                    <strong>
+                      Camera:
+                    </strong>{' '}
+                    {cameraError}
+                  </div>
+                )}
               </div>
             )}
 
@@ -4252,7 +4883,7 @@ export default function Home() {
                           'uppercase',
                       }}
                     >
-                      Risk
+                      Prototype risk
                     </div>
 
                     <strong>
@@ -4274,7 +4905,7 @@ export default function Home() {
                           'uppercase',
                       }}
                     >
-                      Decision
+                      Prototype decision
                     </div>
 
                     <strong
@@ -4335,65 +4966,90 @@ export default function Home() {
                     </strong>
                   </div>
                   <div>
-  <div
-    style={{
-      fontSize: '10px',
-      opacity: 0.65,
-      textTransform: 'uppercase',
-    }}
-  >
-    QR status
-  </div>
+                    <div
+                      style={{
+                        fontSize: '10px',
+                        opacity: 0.65,
+                        textTransform:
+                          'uppercase',
+                      }}
+                    >
+                      Live capture
+                    </div>
 
-  <strong>
-    {analysisResult.qrDetected
-      ? 'Detected'
-      : 'Not detected'}
-  </strong>
-</div>
+                    <strong>
+                      {analysisResult.selfieCaptured
+                        ? 'Captured'
+                        : 'Not captured'}
+                    </strong>
+                  </div>
 
-<div>
-  <div
-    style={{
-      fontSize: '10px',
-      opacity: 0.65,
-      textTransform: 'uppercase',
-    }}
-  >
-    QR verification
-  </div>
+                  <div>
+                    <div
+                      style={{
+                        fontSize: '10px',
+                        opacity: 0.65,
+                        textTransform:
+                          'uppercase',
+                      }}
+                    >
+                      Face match
+                    </div>
 
-  <strong>
-    {analysisResult.qrVerificationStatus === 'verified'
-      ? 'UIDAI signature verified'
-      : analysisResult.qrVerificationStatus === 'invalid'
-        ? 'Invalid signature'
-        : analysisResult.qrDetected
-          ? 'Not verified'
-          : 'Unavailable'}
-  </strong>
-</div>
-<div>
-  <div
-    style={{
-      fontSize: '10px',
-      opacity: 0.65,
-      textTransform: 'uppercase',
-    }}
-  >
-    Authenticity evidence
-  </div>
+                    <strong>
+                      {analysisResult.faceMatchStatus ===
+                      'matched'
+                        ? 'Matched'
+                        : analysisResult.faceMatchStatus ===
+                            'not_matched'
+                          ? 'Not matched'
+                          : 'Needs review'}
+                    </strong>
+                  </div>
 
-  <strong>
-    {analysisResult.authenticityStatus === 'verified'
-      ? 'UIDAI verified'
-      : analysisResult.authenticityStatus === 'invalid'
-        ? 'Invalid'
-        : analysisResult.authenticityStatus === 'not_verified'
-          ? 'Not verified'
-          : 'Not available'}
-  </strong>
-</div>
+                  <div>
+                    <div
+                      style={{
+                        fontSize: '10px',
+                        opacity: 0.65,
+                        textTransform:
+                          'uppercase',
+                      }}
+                    >
+                      Face similarity
+                    </div>
+
+                    <strong>
+                      {Number.isFinite(
+                        analysisResult.faceSimilarity
+                      )
+                        ? `${analysisResult.faceSimilarity}%`
+                        : 'Unavailable'}
+                    </strong>
+                  </div>
+
+                  <div>
+                    <div
+                      style={{
+                        fontSize: '10px',
+                        opacity: 0.65,
+                        textTransform:
+                          'uppercase',
+                      }}
+                    >
+                      Authenticity evidence
+                    </div>
+
+                    <strong>
+                      {analysisResult.faceMatchStatus ===
+                      'matched'
+                        ? 'Portrait + selfie match'
+                        : analysisResult.faceMatchStatus ===
+                            'not_matched'
+                          ? 'Face mismatch'
+                          : 'Review required'}
+                    </strong>
+                  </div>
                   {analysisResult.pdfPage && (
                     <div>
                       <div
@@ -4417,6 +5073,25 @@ export default function Home() {
                     </div>
                   )}
                 </div>
+
+                {analysisResult.authenticityEvidence && (
+                  <p
+                    style={{
+                      marginTop: '16px',
+                      padding: '10px 12px',
+                      borderRadius: '8px',
+                      background:
+                        'rgba(64, 220, 210, 0.06)',
+                      color: '#bff9f4',
+                      fontSize: '12px',
+                    }}
+                  >
+                    <strong>
+                      Authenticity evidence:
+                    </strong>{' '}
+                    {analysisResult.authenticityEvidence}
+                  </p>
+                )}
 
                 <div
                   style={{
@@ -4499,9 +5174,10 @@ export default function Home() {
                       0.65,
                   }}
                 >
-                  OCR and visual checks are screening only. Aadhaar
-                  authenticity is confirmed only when the UIDAI digital
-                  signature reports verified.
+                  Hackathon prototype only: OCR, visual heuristics and the
+                  on-device face comparison do not query UIDAI and are not
+                  official government authentication. A captured selfie is
+                  kept in browser memory and is not uploaded to Supabase.
                 </p>
               </div>
             )}
@@ -4533,14 +5209,18 @@ export default function Home() {
                 status !==
                   'connected' ||
                 running ||
-                !selectedFile
+                !selectedFile ||
+                !selfieFile
               }
               onClick={
                 runSpecimenCheck
               }
             >
               {running
-                ? 'Analyzing…'
+                ? faceModelStatus ===
+                  'loading'
+                  ? 'Comparing faces…'
+                  : 'Analyzing…'
                 : 'Run specimen check'}
             </button>
           </div>

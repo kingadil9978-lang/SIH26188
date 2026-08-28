@@ -10,6 +10,7 @@
   "dependencies": {
     "@peculiar/x509": "^2.0.0",
     "@supabase/supabase-js": "^2.112.4",
+    "@vladmandic/face-api": "^1.7.15",
     "@zip.js/zip.js": "^2.8.60",
     "@zxing/browser": "^0.2.1",
     "fast-xml-parser": "^5.11.1",
