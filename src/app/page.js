@@ -4029,7 +4029,7 @@ const [cameraError, setCameraError] = useState('');
 
             <p className="upload-description">
               Accepted formats:
-              PDF, JPG and PNG.
+              PDF, JPG, PNG and Aadhaar Offline e-KYC ZIP.
               Maximum size: 10 MB.
             </p>
 <input
