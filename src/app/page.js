@@ -2650,7 +2650,7 @@ async function detectFaceDescriptor(
         new faceapi.SsdMobilenetv1Options({
           minConfidence:
             source === 'selfie'
-              ? 0.55
+              ? 0.4
               : 0.3,
           maxResults: 6,
         })
