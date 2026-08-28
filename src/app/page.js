@@ -2,7 +2,7 @@
 import 'reflect-metadata';
 import * as xmldsigjs from 'xmldsigjs';
 import { X509Certificate } from '@peculiar/x509';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import { createWorker } from 'tesseract.js';
 import jsQR from 'jsqr';
@@ -1272,21 +1272,6 @@ function detectQrCode(image) {
   result.data &&
   result.data.trim().length > 0
 ) {
-  console.log(
-    'QR detected:',
-    result
-  );
-
-  console.log(
-    'QR payload:',
-    result.data
-  );
-
-  console.log(
-    'QR payload length:',
-    result.data.length
-  );
-
   resolve({
     detected: true,
     data: result.data,
@@ -1306,16 +1291,6 @@ try {
       ?.trim();
 
   if (zxingPayload) {
-    console.log(
-      'ZXing QR detected:',
-      zxingPayload
-    );
-
-    console.log(
-      'ZXing QR payload length:',
-      zxingPayload.length
-    );
-
     resolve({
       detected: true,
       data: zxingPayload,
@@ -1326,36 +1301,6 @@ try {
 } catch (zxingError) {
   // No QR found in this scan.
   // Continue with the next crop.
-}
-try {
-  const zxingResult =
-     zxingReader.decodeFromCanvas(
-      scanCanvas
-    );
-
-  if (
-    zxingResult &&
-    zxingResult.getText &&
-    zxingResult.getText().trim().length > 0
-  ) {
-    const payload =
-      zxingResult.getText().trim();
-
-    console.log(
-      'ZXing QR detected:',
-      payload
-    );
-
-    resolve({
-      detected: true,
-      data: payload,
-    });
-
-    return;
-  }
-} catch (zxingError) {
-  // ZXing throws when no QR is found.
-  // Continue trying the next crop.
 }
           }
         }
@@ -2676,14 +2621,6 @@ export default function Home() {
     supabase,
     setSupabase,
   ] = useState(null);
-  const videoRef = useRef(null);
-const canvasRef = useRef(null);
-const cameraStreamRef = useRef(null);
-
-const [cameraOpen, setCameraOpen] = useState(false);
-const [cameraReady, setCameraReady] = useState(false);
-const [cameraError, setCameraError] = useState('');
-
   const [
     status,
     setStatus,
