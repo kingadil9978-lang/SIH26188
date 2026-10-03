@@ -987,6 +987,41 @@ section{
   background:var(--line);
 }
 
+.recognition-note,
+.document-identification{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  padding:11px 12px;
+  border:1px solid rgba(64,220,210,.24);
+  background:rgba(64,220,210,.05);
+  color:var(--ink-text-dim);
+  font-size:12px;
+  line-height:1.5;
+}
+
+.recognition-note{
+  margin-top:14px;
+}
+
+.recognition-note strong,
+.document-identification strong{
+  color:var(--ink);
+}
+
+.document-identification{
+  margin-bottom:16px;
+}
+
+.document-identification.recognized{
+  border-color:rgba(64,220,210,.4);
+}
+
+.document-identification.review{
+  border-color:rgba(238,179,83,.45);
+  background:rgba(238,179,83,.06);
+}
+
 .module-grid{
   display:grid;
   grid-template-columns:repeat(2,minmax(0,1fr));

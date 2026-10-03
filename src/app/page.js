@@ -194,40 +194,160 @@ function firstMatch(text, patterns) {
   return '';
 }
 
+const DOCUMENT_TYPE_LABELS = {
+  aadhaar: 'Aadhaar card',
+  passport: 'Passport',
+  driving_license: 'Driving licence',
+  visa: 'Visa',
+  permit: 'Permit document',
+  national_id: 'National identity card',
+  voter_id: 'Voter ID card',
+  pan_card: 'PAN card',
+  ration_card: 'Ration card',
+  mess_card: 'Mess card',
+  student_id: 'Student ID card',
+  employee_id: 'Employee ID card',
+  access_card: 'Access or visitor card',
+  library_card: 'Library card',
+  membership_card: 'Membership card',
+  health_card: 'Health card',
+  other_card: 'Other titled card',
+  unknown: 'Unknown document',
+};
+
+const AUTO_APPROVABLE_PHOTO_ID_TYPES = new Set([
+  'aadhaar',
+  'passport',
+  'driving_license',
+  'visa',
+  'permit',
+  'national_id',
+  'voter_id',
+  'pan_card',
+]);
+
+function getDocumentTypeLabel(docType, fallback = '') {
+  if (docType === 'other_card' && fallback) return fallback;
+  return DOCUMENT_TYPE_LABELS[docType] || fallback || 'Unknown document';
+}
+
+function toReadableTitle(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function classifyNamedCard(text) {
+  const normalized = String(text || '').toUpperCase();
+  const rules = [
+    { docType: 'mess_card', label: 'Mess card', patterns: [/\bMESS\s+CARD\b/, /AUTHORI[ZS]ED\s+DINING\s+ACCESS/] },
+    { docType: 'student_id', label: 'Student ID card', patterns: [/\bSTUDENT\s+(?:ID|IDENTITY)(?:\s+CARD)?\b/, /\bSTUDENT\s+CARD\b/] },
+    { docType: 'employee_id', label: 'Employee ID card', patterns: [/\b(?:EMPLOYEE|STAFF)\s+(?:ID|IDENTITY)(?:\s+CARD)?\b/] },
+    { docType: 'access_card', label: 'Access or visitor card', patterns: [/\bACCESS\s+CARD\b/, /\bVISITOR\s+(?:CARD|PASS)\b/, /\bENTRY\s+PASS\b/] },
+    { docType: 'library_card', label: 'Library card', patterns: [/\bLIBRARY\s+(?:ID\s+)?CARD\b/] },
+    { docType: 'membership_card', label: 'Membership card', patterns: [/\bMEMBER(?:SHIP)?\s+CARD\b/] },
+    { docType: 'health_card', label: 'Health card', patterns: [/\b(?:HEALTH|MEDICAL|INSURANCE)\s+CARD\b/] },
+    { docType: 'voter_id', label: 'Voter ID card', patterns: [/\bVOTER\s+ID\b/, /ELECTOR(?:'S)?\s+PHOTO\s+IDENTITY\s+CARD/, /ELECTION\s+COMMISSION\s+OF\s+INDIA/] },
+    { docType: 'pan_card', label: 'PAN card', patterns: [/\bPAN\s+CARD\b/, /PERMANENT\s+ACCOUNT\s+NUMBER/, /INCOME\s+TAX\s+DEPARTMENT/] },
+    { docType: 'ration_card', label: 'Ration card', patterns: [/\bRATION\s+CARD\b/] },
+  ];
+
+  const exact = rules.find((rule) =>
+    rule.patterns.some((pattern) => pattern.test(normalized))
+  );
+  if (exact) return { ...exact, confidence: 'named' };
+
+  const genericTitle = normalized.match(
+    /\b((?:[A-Z0-9&'-]+\s+){0,3}(?:IDENTITY\s+)?(?:CARD|PASS))\b/
+  )?.[1];
+
+  if (genericTitle && !/^(?:THIS|THE|YOUR)\s+(?:CARD|PASS)$/.test(genericTitle)) {
+    return {
+      docType: 'other_card',
+      label: toReadableTitle(genericTitle),
+      patterns: [],
+      confidence: 'title',
+    };
+  }
+
+  return null;
+}
+
 function extractDocumentFields(text, docType) {
   const compact = String(text || '').replace(/\r/g, '').replace(/[ \t]+/g, ' ');
-  const dates = compact.match(/\b\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}\b/g) || [];
+  const dates = compact.match(/\b(?:\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}|\d{1,2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\s+\d{2,4})\b/gi) || [];
   const fields = {
-    name: firstMatch(compact, [/(?:SURNAME|LAST NAME)\s*[:\-]?\s*([A-Z][A-Z ]{2,40})/i, /(?:GIVEN NAMES?|NAME)\s*[:\-]?\s*([A-Z][A-Z ]{2,40})/i]),
+    name: firstMatch(compact, [/(?:SURNAME|LAST NAME)\s*[:\-]?\s*([A-Z][A-Z .'-]{2,40}?)(?=\s+(?:GIVEN|NATIONALITY|DOB|DATE|SEX|GENDER|ADDRESS|ROLL|COURSE|ID|$))/i, /(?:GIVEN NAMES?|NAME)\s*[:\-]?\s*([A-Z][A-Z .'-]{2,40}?)(?=\s+(?:ROLL|COURSE|DOB|DATE|SEX|GENDER|ADDRESS|ID|START|END|$))/i]),
     documentNumber: '',
     nationality: firstMatch(compact, [/NATIONALITY\s*[:\-]?\s*([A-Z]{2,30})/i]),
-    dateOfBirth: firstMatch(compact, [/(?:DATE OF BIRTH|DOB|BIRTH)\s*[:\-]?\s*(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i]) || dates[0] || '',
-    dateOfExpiry: firstMatch(compact, [/(?:DATE OF EXPIRY|EXPIRY|EXPIRES?|VALID UNTIL)\s*[:\-]?\s*(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i]) || dates[1] || '',
+    dateOfBirth: firstMatch(compact, [/(?:DATE OF BIRTH|DOB|BIRTH)\s*[:\-]?\s*(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}|\d{1,2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\s+\d{2,4})/i]) || dates[0] || '',
+    dateOfExpiry: firstMatch(compact, [/(?:DATE OF EXPIRY|EXPIRY|EXPIRES?|VALID UNTIL)\s*[:\-]?\s*(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}|\d{1,2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\s+\d{2,4})/i]) || dates[1] || '',
     gender: firstMatch(compact, [/(?:SEX|GENDER)\s*[:\-]?\s*(MALE|FEMALE|M|F|X)\b/i]),
     visaType: firstMatch(compact, [/VISA TYPE\s*[:\-]?\s*([A-Z0-9 -]{1,24})/i]),
     stayDuration: firstMatch(compact, [/(?:DURATION OF STAY|STAY DURATION)\s*[:\-]?\s*([A-Z0-9 -]{1,24})/i]),
+    course: firstMatch(compact, [/COURSE\s*[:\-]?\s*([A-Z0-9 .&/-]{2,30}?)(?=\s+(?:START|END|VALID|ID|$))/i]),
   };
   if (docType === 'passport') fields.documentNumber = firstMatch(compact, [/(?:PASSPORT(?: NO| NUMBER)?|DOCUMENT NO)\s*[:\-]?\s*([A-Z][0-9]{7})/i, /\b([A-Z][0-9]{7})\b/]);
   else if (docType === 'visa') fields.documentNumber = firstMatch(compact, [/VISA(?: NO| NUMBER)?\s*[:\-]?\s*([A-Z0-9]{5,20})/i]);
   else if (docType === 'aadhaar') fields.documentNumber = firstMatch(compact, [/\b(\d{4}\s?\d{4}\s?\d{4})\b/]).replace(/\s/g, '');
+  else if (docType === 'pan_card') fields.documentNumber = firstMatch(compact, [/\b([A-Z]{5}\d{4}[A-Z])\b/i]);
+  else if (docType === 'voter_id') fields.documentNumber = firstMatch(compact, [/(?:EPIC|VOTER)(?: NO| NUMBER| ID)?\s*[:\-]?\s*([A-Z0-9/-]{5,24})/i]);
+  else if (['mess_card', 'student_id'].includes(docType)) fields.documentNumber = firstMatch(compact, [/(?:ROLL|ENROL+MENT|REGISTRATION)(?: NO| NUMBER)?\s*[:\-]?\s*([A-Z0-9/-]{3,24})/i]);
+  else if (docType === 'employee_id') fields.documentNumber = firstMatch(compact, [/(?:EMPLOYEE|STAFF)(?: ID| NO| NUMBER| CODE)?\s*[:\-]?\s*([A-Z0-9/-]{3,24})/i]);
   else fields.documentNumber = firstMatch(compact, [/(?:ID|LICEN[CS]E|PERMIT)(?: NO| NUMBER)?\s*[:\-]?\s*([A-Z0-9-]{5,24})/i]);
   return Object.fromEntries(Object.entries(fields).filter(([, value]) => Boolean(value)));
 }
 
 function buildModuleFindings({ docType, extractedFields, anomalyReasons, consistencyScore, ocrConfidence, imageSignals }) {
-  const requiredByType = { passport: ['documentNumber', 'dateOfBirth', 'dateOfExpiry'], visa: ['documentNumber', 'dateOfExpiry'], aadhaar: ['documentNumber', 'dateOfBirth'], driving_license: ['documentNumber', 'dateOfBirth'], permit: ['documentNumber', 'dateOfExpiry'], national_id: ['documentNumber', 'dateOfBirth'] };
+  const requiredByType = {
+    passport: ['documentNumber', 'dateOfBirth', 'dateOfExpiry'],
+    visa: ['documentNumber', 'dateOfExpiry'],
+    aadhaar: ['documentNumber', 'dateOfBirth'],
+    driving_license: ['documentNumber', 'dateOfBirth'],
+    permit: ['documentNumber', 'dateOfExpiry'],
+    national_id: ['documentNumber', 'dateOfBirth'],
+    voter_id: ['documentNumber'],
+    pan_card: ['documentNumber'],
+    mess_card: ['name'],
+    student_id: ['name'],
+    employee_id: ['name'],
+  };
   const missing = (requiredByType[docType] || []).filter((key) => !extractedFields[key]);
   return {
     validationChecks: [
-      { label: 'Document type recognized', status: docType === 'unknown' ? 'review' : 'pass', detail: docType === 'unknown' ? 'No supported document standard was identified.' : docType.replaceAll('_', ' ') },
-      { label: 'Required fields present', status: missing.length ? 'review' : 'pass', detail: missing.length ? `Missing: ${missing.join(', ')}` : 'Core fields were extracted.' },
+      { label: 'Document type recognized', status: docType === 'unknown' ? 'review' : 'pass', detail: docType === 'unknown' ? 'No readable document title or supported pattern was identified.' : getDocumentTypeLabel(docType) },
+      { label: 'Expected fields present', status: missing.length ? 'review' : 'pass', detail: missing.length ? `Not reliably extracted: ${missing.join(', ')}` : 'Expected fields were found, or this card type has no fixed field requirement.' },
       { label: 'Cross-field consistency', status: consistencyScore >= 75 ? 'pass' : 'review', detail: `${consistencyScore}/100 consistency score` },
     ],
     tamperChecks: [
-      { label: 'Photo replacement signals', status: anomalyReasons.includes('unusual_image_noise') ? 'review' : 'pass' },
-      { label: 'Text manipulation signals', status: anomalyReasons.some((item) => ['aadhaar_number_mismatch', 'identity_fields_incomplete', 'low_ocr_confidence'].includes(item)) ? 'review' : 'pass' },
-      { label: 'Stamp / layout quality', status: anomalyReasons.some((item) => ['very_low_edge_density', 'low_contrast_image', 'low_resolution_image'].includes(item)) ? 'review' : 'pass' },
-      { label: 'Image metadata & quality', status: imageSignals && ocrConfidence >= 35 ? 'pass' : 'review' },
+      {
+        label: 'Portrait image quality',
+        status: anomalyReasons.includes('unusual_image_noise') ? 'review' : 'pass',
+        detail: anomalyReasons.includes('unusual_image_noise')
+          ? 'Unusual image noise may reduce portrait comparison reliability.'
+          : 'No coarse image-noise concern was detected.',
+      },
+      {
+        label: 'OCR and field consistency',
+        status: anomalyReasons.some((item) => ['aadhaar_number_mismatch', 'identity_fields_incomplete', 'low_ocr_confidence'].includes(item)) ? 'review' : 'pass',
+        detail: anomalyReasons.some((item) => ['aadhaar_number_mismatch', 'identity_fields_incomplete', 'low_ocr_confidence'].includes(item))
+          ? 'Some text or expected fields need manual review.'
+          : 'OCR text and the checked fields are internally consistent.',
+      },
+      {
+        label: 'Resolution, contrast and layout',
+        status: anomalyReasons.some((item) => ['very_low_edge_density', 'low_contrast_image', 'low_resolution_image'].includes(item)) ? 'review' : 'pass',
+        detail: anomalyReasons.some((item) => ['very_low_edge_density', 'low_contrast_image', 'low_resolution_image'].includes(item))
+          ? 'The image quality may be too weak for reliable automated screening.'
+          : 'The coarse resolution, contrast and edge checks passed.',
+      },
+      {
+        label: 'OCR usability',
+        status: imageSignals && ocrConfidence >= 35 ? 'pass' : 'review',
+        detail: imageSignals && ocrConfidence >= 35
+          ? 'The image produced usable OCR and visual quality signals.'
+          : 'OCR or image-quality signals were not strong enough.',
+      },
     ],
   };
 }
@@ -1503,7 +1623,7 @@ const aadhaarNumberMismatch =
    * Date of birth/date pattern.
    */
   const hasDate =
-    /\b\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}\b/.test(
+    /\b(?:\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4}|\d{1,2}\s+(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|SEPT|OCT|NOV|DEC)[A-Z]*\s+\d{2,4})\b/.test(
       normalized
     );
 
@@ -1525,6 +1645,8 @@ const aadhaarNumberMismatch =
     normalized.includes(
       'UNIQUE IDENTIFICATION AUTHORITY'
     );
+
+  const namedCardMatch = classifyNamedCard(normalized);
 
   /*
    * ---------------------------------------------
@@ -1565,6 +1687,10 @@ const aadhaarNumberMismatch =
 
   if (hasUIDAIMarker) {
     detectionScore += 12;
+  }
+
+  if (namedCardMatch) {
+    detectionScore += namedCardMatch.confidence === 'named' ? 70 : 45;
   }
 
   /*
@@ -1671,6 +1797,8 @@ const aadhaarNumberMismatch =
     docType = 'visa';
   } else if (isPermit) {
     docType = 'permit';
+  } else if (namedCardMatch) {
+    docType = namedCardMatch.docType;
   } else if (
     detectionScore >= 45 &&
     (
@@ -1685,6 +1813,21 @@ const aadhaarNumberMismatch =
   const isIdentityDocument =
     docType !==
     'unknown';
+
+  const documentLabel = getDocumentTypeLabel(
+    docType,
+    namedCardMatch?.label
+  );
+
+  const requiresDate = [
+    'aadhaar',
+    'passport',
+    'driving_license',
+    'visa',
+    'permit',
+    'national_id',
+    'voter_id',
+  ].includes(docType);
 
   /*
    * ---------------------------------------------
@@ -1765,7 +1908,7 @@ if (
    * Expected identity fields.
    */
   if (
-    isIdentityDocument &&
+    requiresDate &&
     !hasDate
   ) {
     anomalyReasons.push(
@@ -1805,7 +1948,7 @@ if (
   let consistencyScore = 100;
 
   if (
-    isIdentityDocument &&
+    requiresDate &&
     !hasDate
   ) {
     consistencyScore -= 15;
@@ -2116,6 +2259,13 @@ const authenticityStatus =
     );
   }
 
+  if (namedCardMatch) {
+    reasonCodes.push(
+      'printed_card_title_detected',
+      `${docType}_detected`
+    );
+  }
+
   reasonCodes.push(
     `consistency_score_${consistencyScore}`
   );
@@ -2144,7 +2294,7 @@ const authenticityStatus =
     );
 
     if (authenticityStatus === 'pending_face_match') {
-      reasonCodes.push('live_face_match_required');
+      reasonCodes.push('camera_face_match_required');
     }
   }
 
@@ -2156,6 +2306,7 @@ const authenticityStatus =
   authenticityStatus,
 
   docType,
+  documentLabel,
 
     confidence:
       detectionScore,
@@ -2722,7 +2873,7 @@ async function detectFaceDescriptor(
     throw new Error(
       source === 'selfie'
         ? 'No face was detected in the live selfie. Retake it in brighter light and look straight at the camera.'
-        : 'No portrait was detected in the Aadhaar image. Upload a clearer scan with the photo visible.'
+        : 'No portrait was detected in the document image. Use a clearer photo with the printed portrait fully visible.'
     );
   }
 
@@ -2784,11 +2935,11 @@ async function compareDocumentFaceToSelfie(
 
   /*
    * Face-API descriptors are commonly compared around a 0.6 distance.
-   * A stricter 0.55 threshold reduces false accepts for this prototype.
-   * The displayed score is an explainable heuristic, not a calibrated
-   * biometric probability.
+   * This prototype uses that general threshold so older or small printed
+   * ID portraits are not rejected solely because of scan quality. The
+   * displayed score is a heuristic, not a calibrated biometric probability.
    */
-  const matched = distance <= 0.55;
+  const matched = distance <= 0.6;
   const similarityScore =
     Math.max(
       0,
@@ -2823,37 +2974,51 @@ function applyFaceMatchDecision(
     (analysis.reasonCodes || [])
       .filter(
         (reason) =>
-          reason !==
-          'live_face_match_required'
+          ![
+            'live_face_match_required',
+            'camera_face_match_required',
+          ].includes(reason)
       );
 
   reasonCodes.push(
-    'live_selfie_captured',
+    'camera_selfie_captured',
     'document_face_detected',
     'selfie_face_detected'
   );
 
-  if (
-    analysis.docType !==
-    'aadhaar'
-  ) {
+  const documentRecognized =
+    analysis.docType !== 'unknown';
+  const documentLabel =
+    analysis.documentLabel ||
+    getDocumentTypeLabel(analysis.docType);
+  const describedDocument =
+    documentRecognized
+      ? `the ${documentLabel.toLowerCase()}`
+      : 'the document';
+
+  if (faceMatch.documentFaceCount !== 1) {
     reasonCodes.push(
-      'aadhaar_classification_required'
+      'multiple_document_faces_detected'
     );
 
     return {
       ...analysis,
-      faceMatchStatus:
-        'not_evaluated',
+      faceMatchStatus: 'ambiguous',
+      faceSimilarity:
+        faceMatch.similarityScore,
+      faceDistance:
+        Number(
+          faceMatch.distance.toFixed(3)
+        ),
       selfieCaptured: true,
       authenticityStatus:
         'review_required',
       authenticityEvidence:
-        'Live selfie captured; Aadhaar classification was not strong enough for face approval.',
+        'More than one face was detected on the document. No single portrait was used for automatic approval.',
       decision: 'review',
       riskScore:
         Math.max(
-          60,
+          65,
           analysis.riskScore
         ),
       reasonCodes:
@@ -2861,7 +3026,7 @@ function applyFaceMatchDecision(
           new Set(reasonCodes)
         ),
       reason:
-        'The document must first be identified as Aadhaar before the face comparison can approve it.',
+        'Multiple document portraits were detected. Select a document with one clearly visible holder portrait or review it manually.',
     };
   }
 
@@ -2869,6 +3034,36 @@ function applyFaceMatchDecision(
     reasonCodes.push(
       'face_match_passed'
     );
+
+    const validationPassed =
+      (analysis.validationChecks || [])
+        .every((check) => check.status === 'pass');
+    const hasBlockingAnomaly =
+      (analysis.anomalyReasons || []).length > 0;
+    const supportsAutomaticApproval =
+      AUTO_APPROVABLE_PHOTO_ID_TYPES.has(
+        analysis.docType
+      );
+    const screeningPassed =
+      documentRecognized &&
+      supportsAutomaticApproval &&
+      validationPassed &&
+      !hasBlockingAnomaly &&
+      analysis.decision === 'approved';
+
+    if (!documentRecognized) {
+      reasonCodes.push(
+        'document_type_review_required'
+      );
+    } else if (!supportsAutomaticApproval) {
+      reasonCodes.push(
+        'issuer_verification_required'
+      );
+    } else if (!screeningPassed) {
+      reasonCodes.push(
+        'document_screening_review_required'
+      );
+    }
 
     return {
       ...analysis,
@@ -2883,19 +3078,30 @@ function applyFaceMatchDecision(
       authenticityStatus:
         'face_match_passed',
       authenticityEvidence:
-        'Aadhaar portrait matched the live camera capture in the on-device prototype check.',
-      decision: 'approved',
+        `The portrait on ${describedDocument} matched the camera selfie in the on-device prototype check. This confirms face similarity only, not liveness or issuer authenticity.`,
+      decision:
+        screeningPassed
+          ? 'approved'
+          : 'review',
       riskScore:
-        Math.min(
-          20,
-          analysis.riskScore
-        ),
+        screeningPassed
+          ? Math.min(
+              20,
+              analysis.riskScore
+            )
+          : analysis.riskScore,
       reasonCodes:
         Array.from(
           new Set(reasonCodes)
         ),
       reason:
-        'Prototype pass: Aadhaar indicators were detected and the document portrait matched the live selfie.',
+        screeningPassed
+          ? `Prototype face check passed for ${documentLabel}: the document portrait matched the camera selfie.`
+          : !documentRecognized
+            ? 'The document portrait matched the camera selfie, but the document type still needs review.'
+            : !supportsAutomaticApproval
+              ? `The portrait matched, but ${documentLabel} issuer validity is not independently verified by this prototype.`
+              : 'The document portrait matched the live selfie, but one or more document screening checks still need review.',
     };
   }
 
@@ -2916,7 +3122,7 @@ function applyFaceMatchDecision(
     authenticityStatus:
       'face_match_failed',
     authenticityEvidence:
-      'The Aadhaar portrait did not match the live camera capture.',
+      `The portrait on ${describedDocument} did not match the camera selfie closely enough.`,
     decision: 'rejected',
     riskScore: 100,
     reasonCodes:
@@ -2924,7 +3130,7 @@ function applyFaceMatchDecision(
         new Set(reasonCodes)
       ),
     reason:
-      'Prototype rejection: the live selfie did not match the Aadhaar portrait closely enough.',
+      'Prototype rejection: the camera selfie did not match the document portrait closely enough.',
   };
 }
 
@@ -3530,7 +3736,7 @@ export default function Home() {
 
       const file = new File(
         [blob],
-        `aadhaar-camera-${Date.now()}.jpg`,
+        `document-camera-${Date.now()}.jpg`,
         { type: 'image/jpeg' }
       );
       const previewUrl = URL.createObjectURL(file);
@@ -3895,7 +4101,7 @@ export default function Home() {
           Array.from(
             new Set([
               ...(analysis.reasonCodes || []),
-              'live_selfie_captured',
+              'camera_selfie_captured',
               'face_match_unavailable',
             ])
           ),
@@ -3927,7 +4133,7 @@ export default function Home() {
         Array.from(
           new Set([
             ...(analysis.reasonCodes || []),
-            'live_selfie_captured',
+            'camera_selfie_captured',
             'document_portrait_unavailable',
           ])
         ),
@@ -4813,16 +5019,17 @@ export default function Home() {
 
             <p className="upload-description">
               Upload a digital file, or use the camera to photograph a
-              physical Aadhaar card. Maximum file size: 10 MB.
+              physical document or card. Maximum file size: 10 MB.
             </p>
 
             <div className="document-capture-panel">
               <div className="document-capture-heading">
-                Physical Aadhaar card
+                Physical document or card
               </div>
               <p className="upload-description">
-                Place the full card inside the frame with readable text and
-                even lighting. On phones, the rear camera is preferred.
+                Place the full document inside the frame with its title,
+                printed portrait and text visible in even lighting. On phones,
+                the rear camera is preferred.
               </p>
               <p className="capture-privacy-note">
                 The live preview stays on this device. After capture, the
@@ -4846,7 +5053,7 @@ export default function Home() {
               {documentPreview && !documentCameraOpen && (
                 <img
                   src={documentPreview}
-                  alt="Captured Aadhaar document"
+                  alt="Captured document"
                   className="document-preview"
                 />
               )}
@@ -4862,8 +5069,8 @@ export default function Home() {
                     {documentCameraStarting
                       ? 'Opening camera…'
                       : documentPreview
-                        ? 'Retake Aadhaar photo'
-                        : 'Photograph Aadhaar'}
+                        ? 'Retake document photo'
+                        : 'Photograph document'}
                   </button>
                 )}
 
@@ -4905,6 +5112,15 @@ export default function Home() {
                   {documentCameraError}
                 </div>
               )}
+            </div>
+
+            <div className="recognition-note">
+              <strong>Document recognition:</strong>{' '}
+              Printed titles and OCR patterns can identify Aadhaar, passport,
+              driving licence, visa, permits, national/voter/PAN/ration IDs,
+              and common mess, student, employee, access, library, membership
+              and health cards. Unfamiliar cards may be labelled from a
+              readable title and kept for review.
             </div>
 
             <div className="document-source-divider">
@@ -5022,7 +5238,7 @@ export default function Home() {
                 }}
               >
                 <div className="upload-title">
-                  Live selfie comparison
+                  Camera selfie comparison
                 </div>
 
                 <p className="upload-description">
@@ -5030,7 +5246,8 @@ export default function Home() {
                   front-facing photo. It is
                   processed locally in this
                   browser and is not uploaded
-                  to Supabase.
+                  to Supabase. This compares faces only; it does not perform
+                  liveness or anti-spoof detection.
                 </p>
 
                 {cameraOpen && (
@@ -5057,7 +5274,7 @@ export default function Home() {
                 {selfiePreview && (
                   <img
                     src={selfiePreview}
-                    alt="Captured live selfie"
+                    alt="Captured camera selfie"
                     style={{
                       display: 'block',
                       width: '100%',
@@ -5130,7 +5347,7 @@ export default function Home() {
                       fontSize: '12px',
                     }}
                   >
-                    Live capture ready for
+                    Camera selfie ready for
                     local face comparison.
                   </p>
                 )}
@@ -5171,6 +5388,25 @@ export default function Home() {
                 }}
               >
                 <div
+                  className={`document-identification ${
+                    analysisResult.docType === 'unknown'
+                      ? 'review'
+                      : 'recognized'
+                  }`}
+                >
+                  <strong>
+                    {analysisResult.docType === 'unknown'
+                      ? 'Document type needs review'
+                      : `Detected document: ${analysisResult.documentLabel || getDocumentTypeLabel(analysisResult.docType)}.`}
+                  </strong>
+                  <span>
+                    {analysisResult.docType === 'unknown'
+                      ? 'The face comparison can still run, but OCR could not identify a reliable card title or supported document pattern.'
+                      : 'This type is inferred from readable text and document patterns; it is not proof that the issuer or document is genuine.'}
+                  </span>
+                </div>
+
+                <div
                   style={{
                     display:
                       'grid',
@@ -5201,7 +5437,8 @@ export default function Home() {
                       }}
                     >
                       {escapeText(
-                        analysisResult.docType
+                        analysisResult.documentLabel ||
+                          getDocumentTypeLabel(analysisResult.docType)
                       )}
                     </strong>
                   </div>
@@ -5261,7 +5498,7 @@ export default function Home() {
                           'uppercase',
                       }}
                     >
-                      Prototype decision
+                      Overall screening
                     </div>
 
                     <strong
@@ -5330,7 +5567,7 @@ export default function Home() {
                           'uppercase',
                       }}
                     >
-                      Live capture
+                      Camera selfie
                     </div>
 
                     <strong>
@@ -5372,14 +5609,14 @@ export default function Home() {
                           'uppercase',
                       }}
                     >
-                      Face similarity
+                      Face distance
                     </div>
 
                     <strong>
                       {Number.isFinite(
-                        analysisResult.faceSimilarity
+                        analysisResult.faceDistance
                       )
-                        ? `${analysisResult.faceSimilarity}%`
+                        ? `${analysisResult.faceDistance.toFixed(3)} (match ≤ 0.600)`
                         : 'Unavailable'}
                     </strong>
                   </div>
@@ -5393,7 +5630,7 @@ export default function Home() {
                           'uppercase',
                       }}
                     >
-                      Authenticity evidence
+                      Face evidence
                     </div>
 
                     <strong>
@@ -5443,7 +5680,7 @@ export default function Home() {
                     }}
                   >
                     <strong>
-                      Authenticity evidence:
+                      Face comparison evidence:
                     </strong>{' '}
                     {analysisResult.authenticityEvidence}
                   </p>
@@ -5474,11 +5711,11 @@ export default function Home() {
                     ))}
                   </div>
                   <div className="result-module">
-                    <div className="result-module-title">Tampering detection</div>
+                    <div className="result-module-title">Image & OCR quality heuristics</div>
                     {(analysisResult.tamperChecks || []).map((check) => (
                       <div className={`check-row ${check.status}`} key={check.label}>
                         <span>{check.status === 'pass' ? '✓' : '!'}</span>
-                        <div><strong>{check.label}</strong><small>{check.status === 'pass' ? 'No alert raised' : 'Manual review recommended'}</small></div>
+                        <div><strong>{check.label}</strong><small>{check.detail}</small></div>
                       </div>
                     ))}
                   </div>
@@ -5566,9 +5803,11 @@ export default function Home() {
                   }}
                 >
                   Hackathon prototype only: OCR, visual heuristics and the
-                  on-device face comparison do not query UIDAI and are not
-                  official government authentication. A captured selfie is
-                  kept in browser memory and is not uploaded to Supabase.
+                  on-device face comparison do not query an issuing authority
+                  and are not official document authentication. OCR-based type
+                  labels may be wrong on unclear images. The selfie check has
+                  no liveness or anti-spoof test. A captured selfie is kept in
+                  browser memory and is not uploaded to Supabase.
                 </p>
               </div>
             )}
