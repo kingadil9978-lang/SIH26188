@@ -186,6 +186,52 @@ function escapeText(value) {
   return String(value ?? '');
 }
 
+function firstMatch(text, patterns) {
+  for (const pattern of patterns) {
+    const match = String(text || '').match(pattern);
+    if (match?.[1]) return match[1].trim();
+  }
+  return '';
+}
+
+function extractDocumentFields(text, docType) {
+  const compact = String(text || '').replace(/\r/g, '').replace(/[ \t]+/g, ' ');
+  const dates = compact.match(/\b\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}\b/g) || [];
+  const fields = {
+    name: firstMatch(compact, [/(?:SURNAME|LAST NAME)\s*[:\-]?\s*([A-Z][A-Z ]{2,40})/i, /(?:GIVEN NAMES?|NAME)\s*[:\-]?\s*([A-Z][A-Z ]{2,40})/i]),
+    documentNumber: '',
+    nationality: firstMatch(compact, [/NATIONALITY\s*[:\-]?\s*([A-Z]{2,30})/i]),
+    dateOfBirth: firstMatch(compact, [/(?:DATE OF BIRTH|DOB|BIRTH)\s*[:\-]?\s*(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i]) || dates[0] || '',
+    dateOfExpiry: firstMatch(compact, [/(?:DATE OF EXPIRY|EXPIRY|EXPIRES?|VALID UNTIL)\s*[:\-]?\s*(\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})/i]) || dates[1] || '',
+    gender: firstMatch(compact, [/(?:SEX|GENDER)\s*[:\-]?\s*(MALE|FEMALE|M|F|X)\b/i]),
+    visaType: firstMatch(compact, [/VISA TYPE\s*[:\-]?\s*([A-Z0-9 -]{1,24})/i]),
+    stayDuration: firstMatch(compact, [/(?:DURATION OF STAY|STAY DURATION)\s*[:\-]?\s*([A-Z0-9 -]{1,24})/i]),
+  };
+  if (docType === 'passport') fields.documentNumber = firstMatch(compact, [/(?:PASSPORT(?: NO| NUMBER)?|DOCUMENT NO)\s*[:\-]?\s*([A-Z][0-9]{7})/i, /\b([A-Z][0-9]{7})\b/]);
+  else if (docType === 'visa') fields.documentNumber = firstMatch(compact, [/VISA(?: NO| NUMBER)?\s*[:\-]?\s*([A-Z0-9]{5,20})/i]);
+  else if (docType === 'aadhaar') fields.documentNumber = firstMatch(compact, [/\b(\d{4}\s?\d{4}\s?\d{4})\b/]).replace(/\s/g, '');
+  else fields.documentNumber = firstMatch(compact, [/(?:ID|LICEN[CS]E|PERMIT)(?: NO| NUMBER)?\s*[:\-]?\s*([A-Z0-9-]{5,24})/i]);
+  return Object.fromEntries(Object.entries(fields).filter(([, value]) => Boolean(value)));
+}
+
+function buildModuleFindings({ docType, extractedFields, anomalyReasons, consistencyScore, ocrConfidence, imageSignals }) {
+  const requiredByType = { passport: ['documentNumber', 'dateOfBirth', 'dateOfExpiry'], visa: ['documentNumber', 'dateOfExpiry'], aadhaar: ['documentNumber', 'dateOfBirth'], driving_license: ['documentNumber', 'dateOfBirth'], permit: ['documentNumber', 'dateOfExpiry'], national_id: ['documentNumber', 'dateOfBirth'] };
+  const missing = (requiredByType[docType] || []).filter((key) => !extractedFields[key]);
+  return {
+    validationChecks: [
+      { label: 'Document type recognized', status: docType === 'unknown' ? 'review' : 'pass', detail: docType === 'unknown' ? 'No supported document standard was identified.' : docType.replaceAll('_', ' ') },
+      { label: 'Required fields present', status: missing.length ? 'review' : 'pass', detail: missing.length ? `Missing: ${missing.join(', ')}` : 'Core fields were extracted.' },
+      { label: 'Cross-field consistency', status: consistencyScore >= 75 ? 'pass' : 'review', detail: `${consistencyScore}/100 consistency score` },
+    ],
+    tamperChecks: [
+      { label: 'Photo replacement signals', status: anomalyReasons.includes('unusual_image_noise') ? 'review' : 'pass' },
+      { label: 'Text manipulation signals', status: anomalyReasons.some((item) => ['aadhaar_number_mismatch', 'identity_fields_incomplete', 'low_ocr_confidence'].includes(item)) ? 'review' : 'pass' },
+      { label: 'Stamp / layout quality', status: anomalyReasons.some((item) => ['very_low_edge_density', 'low_contrast_image', 'low_resolution_image'].includes(item)) ? 'review' : 'pass' },
+      { label: 'Image metadata & quality', status: imageSignals && ocrConfidence >= 35 ? 'pass' : 'review' },
+    ],
+  };
+}
+
 const UIDAI_CERTIFICATE_PATH = '/uidai_offline_publickey_2026.cer';
 async function inspectOfflineKycZip(
   file,
@@ -1388,6 +1434,8 @@ function evaluateScreening({
     'DRIVING',
     'LICENCE',
     'LICENSE',
+    'VISA',
+    'PERMIT',
     'DATE OF BIRTH',
     'DOB',
     'GOVERNMENT OF INDIA',
@@ -1600,6 +1648,9 @@ const aadhaarNumberMismatch =
       hasName
     );
 
+  const isVisa = normalized.includes('VISA') && (hasDate || /\b[A-Z0-9]{6,16}\b/.test(normalized));
+  const isPermit = normalized.includes('PERMIT') && (hasDate || hasName);
+
   let docType =
     'unknown';
 
@@ -1616,6 +1667,10 @@ const aadhaarNumberMismatch =
   ) {
     docType =
       'driving_license';
+  } else if (isVisa) {
+    docType = 'visa';
+  } else if (isPermit) {
+    docType = 'permit';
   } else if (
     detectionScore >= 45 &&
     (
@@ -2093,6 +2148,9 @@ const authenticityStatus =
     }
   }
 
+  const extractedFields = extractDocumentFields(text, docType);
+  const moduleFindings = buildModuleFindings({ docType, extractedFields, anomalyReasons, consistencyScore, ocrConfidence, imageSignals });
+
   return {
   isIdentityDocument,
   authenticityStatus,
@@ -2123,6 +2181,8 @@ const authenticityStatus =
       normalized,
 
     anomalyReasons,
+    extractedFields,
+    ...moduleFindings,
 
     reason:
       !isIdentityDocument
@@ -3551,14 +3611,6 @@ export default function Home() {
   ----------------------------------------------------- */
 
   async function runSpecimenCheck() {
-    if (!supabase) {
-      setLedgerError(
-        'Supabase is not connected yet.'
-      );
-
-      return;
-    }
-
     if (!selfieFile) {
       setUploadError(
         'Capture a live selfie before running the verification.'
@@ -3689,12 +3741,13 @@ export default function Home() {
       /*
        * 2. Upload file.
        */
-      const uploaded =
-        await uploadSelectedDocument();
-
-      if (!uploaded) {
+      if (!supabase) {
+        setLedgerError('Screening completed locally. Connect Supabase to save the document hash and audit event.');
         return;
       }
+
+      const uploaded = await uploadSelectedDocument();
+      if (!uploaded) return;
 
       /*
        * 3. Hash the real file.
@@ -5093,6 +5146,41 @@ export default function Home() {
                   </p>
                 )}
 
+                {Object.keys(analysisResult.extractedFields || {}).length > 0 && (
+                  <div className="result-module">
+                    <div className="result-module-title">OCR extracted fields</div>
+                    <div className="field-grid">
+                      {Object.entries(analysisResult.extractedFields).map(([key, value]) => (
+                        <div className="field-card" key={key}>
+                          <span>{key.replace(/([A-Z])/g, ' $1')}</span>
+                          <strong>{escapeText(value)}</strong>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="module-grid">
+                  <div className="result-module">
+                    <div className="result-module-title">Document validation</div>
+                    {(analysisResult.validationChecks || []).map((check) => (
+                      <div className={`check-row ${check.status}`} key={check.label}>
+                        <span>{check.status === 'pass' ? '✓' : '!'}</span>
+                        <div><strong>{check.label}</strong><small>{check.detail}</small></div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="result-module">
+                    <div className="result-module-title">Tampering detection</div>
+                    {(analysisResult.tamperChecks || []).map((check) => (
+                      <div className={`check-row ${check.status}`} key={check.label}>
+                        <span>{check.status === 'pass' ? '✓' : '!'}</span>
+                        <div><strong>{check.label}</strong><small>{check.status === 'pass' ? 'No alert raised' : 'Manual review recommended'}</small></div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
                 <div
                   style={{
                     marginTop:
@@ -5206,8 +5294,6 @@ export default function Home() {
             <button
               className="run-btn"
               disabled={
-                status !==
-                  'connected' ||
                 running ||
                 !selectedFile ||
                 !selfieFile
