@@ -2985,9 +2985,19 @@ export default function Home() {
     setAnalysisResult,
   ] = useState(null);
 
+  const documentVideoRef = useRef(null);
+  const documentCameraStreamRef = useRef(null);
+  const documentCameraRequestRef = useRef(0);
+  const [documentCameraOpen, setDocumentCameraOpen] = useState(false);
+  const [documentCameraStarting, setDocumentCameraStarting] = useState(false);
+  const [documentCapturing, setDocumentCapturing] = useState(false);
+  const [documentCameraError, setDocumentCameraError] = useState('');
+  const [documentPreview, setDocumentPreview] = useState('');
+
   const videoRef = useRef(null);
   const cameraStreamRef =
     useRef(null);
+  const cameraRequestRef = useRef(0);
 
   const [
     cameraOpen,
@@ -3026,6 +3036,19 @@ export default function Home() {
 
   useEffect(() => {
     if (
+      documentCameraOpen &&
+      documentVideoRef.current &&
+      documentCameraStreamRef.current
+    ) {
+      documentVideoRef.current.srcObject = documentCameraStreamRef.current;
+      documentVideoRef.current.play().catch(() => {
+        setDocumentCameraError('The document camera opened, but the preview could not start.');
+      });
+    }
+  }, [documentCameraOpen]);
+
+  useEffect(() => {
+    if (
       cameraOpen &&
       videoRef.current &&
       cameraStreamRef.current
@@ -3045,13 +3068,38 @@ export default function Home() {
 
   useEffect(
     () => () => {
+      cameraRequestRef.current += 1;
+      documentCameraRequestRef.current += 1;
       cameraStreamRef.current
+        ?.getTracks()
+        .forEach((track) =>
+          track.stop()
+        );
+      documentCameraStreamRef.current
         ?.getTracks()
         .forEach((track) =>
           track.stop()
         );
     },
     []
+  );
+
+  useEffect(
+    () => () => {
+      if (documentPreview) {
+        URL.revokeObjectURL(documentPreview);
+      }
+    },
+    [documentPreview]
+  );
+
+  useEffect(
+    () => () => {
+      if (selfiePreview) {
+        URL.revokeObjectURL(selfiePreview);
+      }
+    },
+    [selfiePreview]
   );
 
   /* -----------------------------------------------------
@@ -3361,7 +3409,153 @@ export default function Home() {
      UPLOAD TO STORAGE
   ----------------------------------------------------- */
 
+  function stopDocumentCamera() {
+    documentCameraRequestRef.current += 1;
+    documentCameraStreamRef.current
+      ?.getTracks()
+      .forEach((track) => track.stop());
+    documentCameraStreamRef.current = null;
+    if (documentVideoRef.current) {
+      documentVideoRef.current.pause();
+      documentVideoRef.current.srcObject = null;
+    }
+    setDocumentCameraOpen(false);
+    setDocumentCameraStarting(false);
+    setDocumentCapturing(false);
+  }
+
+  function clearDocumentPreview() {
+    setDocumentPreview((current) => {
+      if (current) URL.revokeObjectURL(current);
+      return '';
+    });
+  }
+
+  async function startDocumentCamera() {
+    setDocumentCameraError('');
+    setUploadError('');
+    setLedgerError('');
+    setAnalysisResult(null);
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setDocumentCameraError(
+        'This browser does not provide camera access. Use a recent Chrome, Edge or Safari browser over HTTPS.'
+      );
+      return;
+    }
+
+    let requestId = null;
+
+    try {
+      stopCamera();
+      stopDocumentCamera();
+
+      requestId = documentCameraRequestRef.current + 1;
+      documentCameraRequestRef.current = requestId;
+      setDocumentCameraStarting(true);
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
+      });
+
+      if (requestId !== documentCameraRequestRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
+      documentCameraStreamRef.current = stream;
+      setDocumentCameraOpen(true);
+    } catch (error) {
+      if (documentCameraRequestRef.current === requestId) {
+      setDocumentCameraError(
+        error?.name === 'NotAllowedError'
+          ? 'Camera permission was denied. Allow camera access and try again.'
+          : 'Unable to open the document camera. Check that another app is not using it.'
+      );
+      }
+    } finally {
+      if (documentCameraRequestRef.current === requestId) {
+        setDocumentCameraStarting(false);
+      }
+    }
+  }
+
+  async function captureDocumentPhoto() {
+    const video = documentVideoRef.current;
+
+    if (!video || !video.videoWidth || !video.videoHeight) {
+      setDocumentCameraError('The camera is still starting. Wait a moment and try again.');
+      return;
+    }
+
+    const maxDimension = 2200;
+    const scale = Math.min(
+      1,
+      maxDimension / Math.max(video.videoWidth, video.videoHeight)
+    );
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+    const context = canvas.getContext('2d');
+
+    if (!context) {
+      setDocumentCameraError('Unable to capture the document frame.');
+      return;
+    }
+
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    try {
+      setDocumentCapturing(true);
+      const blob = await new Promise((resolve, reject) =>
+        canvas.toBlob(
+          (value) => value
+            ? resolve(value)
+            : reject(new Error('Unable to create the document image.')),
+          'image/jpeg',
+          0.95
+        )
+      );
+
+      if (blob.size > MAX_FILE_SIZE) {
+        throw new Error(
+          'The captured image is larger than 10 MB. Move closer, improve lighting and retake it.'
+        );
+      }
+
+      const file = new File(
+        [blob],
+        `aadhaar-camera-${Date.now()}.jpg`,
+        { type: 'image/jpeg' }
+      );
+      const previewUrl = URL.createObjectURL(file);
+
+      clearDocumentPreview();
+      setDocumentPreview(previewUrl);
+      setSelectedFile(file);
+      setShareCode('');
+      setDocumentCameraError('');
+      setAnalysisResult(null);
+      setUploadError('');
+      setLedgerError('');
+      clearSelfie();
+      stopDocumentCamera();
+    } catch (error) {
+      setDocumentCameraError(error.message || 'Unable to capture the document image.');
+    } finally {
+      setDocumentCapturing(false);
+      canvas.width = 1;
+      canvas.height = 1;
+    }
+  }
+
   function stopCamera() {
+    cameraRequestRef.current += 1;
     cameraStreamRef.current
       ?.getTracks()
       .forEach((track) =>
@@ -3370,6 +3564,10 @@ export default function Home() {
 
     cameraStreamRef.current =
       null;
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.srcObject = null;
+    }
     setCameraOpen(false);
   }
 
@@ -3406,7 +3604,11 @@ export default function Home() {
     }
 
     try {
+      stopDocumentCamera();
       stopCamera();
+
+      const requestId = cameraRequestRef.current + 1;
+      cameraRequestRef.current = requestId;
 
       const stream =
         await navigator.mediaDevices.getUserMedia({
@@ -3421,6 +3623,11 @@ export default function Home() {
             },
           },
         });
+
+      if (requestId !== cameraRequestRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
 
       cameraStreamRef.current =
         stream;
@@ -4583,7 +4790,7 @@ export default function Home() {
           </h2>
 
           <p>
-            Upload a document to run
+            Upload a document or photograph a physical card to run
             the screening pipeline.
             The latest verification
             events appear below.
@@ -4601,15 +4808,109 @@ export default function Home() {
             }}
           >
             <div className="upload-title">
-              Upload a document for
-              verification
+              Provide a document for verification
             </div>
 
             <p className="upload-description">
-              Accepted formats:
-              PDF, JPG, PNG and Aadhaar Offline e-KYC ZIP.
-              Maximum size: 10 MB.
+              Upload a digital file, or use the camera to photograph a
+              physical Aadhaar card. Maximum file size: 10 MB.
             </p>
+
+            <div className="document-capture-panel">
+              <div className="document-capture-heading">
+                Physical Aadhaar card
+              </div>
+              <p className="upload-description">
+                Place the full card inside the frame with readable text and
+                even lighting. On phones, the rear camera is preferred.
+              </p>
+              <p className="capture-privacy-note">
+                The live preview stays on this device. After capture, the
+                photo follows the same screening and optional Supabase upload
+                flow as a selected image file.
+              </p>
+
+              {documentCameraOpen && (
+                <div className="document-camera-stage">
+                  <video
+                    ref={documentVideoRef}
+                    autoPlay
+                    muted
+                    playsInline
+                    className="document-camera-video"
+                  />
+                  <div className="document-camera-guide" aria-hidden="true" />
+                </div>
+              )}
+
+              {documentPreview && !documentCameraOpen && (
+                <img
+                  src={documentPreview}
+                  alt="Captured Aadhaar document"
+                  className="document-preview"
+                />
+              )}
+
+              <div className="document-camera-actions">
+                {!documentCameraOpen && (
+                  <button
+                    type="button"
+                    className="run-btn"
+                    onClick={startDocumentCamera}
+                    disabled={documentCameraStarting || running}
+                  >
+                    {documentCameraStarting
+                      ? 'Opening camera…'
+                      : documentPreview
+                        ? 'Retake Aadhaar photo'
+                        : 'Photograph Aadhaar'}
+                  </button>
+                )}
+
+                {documentCameraStarting && (
+                  <button
+                    type="button"
+                    className="run-btn"
+                    onClick={stopDocumentCamera}
+                  >
+                    Cancel
+                  </button>
+                )}
+
+                {documentCameraOpen && (
+                  <>
+                    <button
+                      type="button"
+                    className="run-btn"
+                    onClick={captureDocumentPhoto}
+                    disabled={documentCapturing || running}
+                    >
+                      {documentCapturing ? 'Capturing…' : 'Capture document'}
+                    </button>
+                    <button
+                      type="button"
+                      className="run-btn"
+                      onClick={stopDocumentCamera}
+                      disabled={documentCapturing}
+                    >
+                      Cancel camera
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {documentCameraError && (
+                <div className="ledger-error">
+                  <strong>Document camera:</strong>{' '}
+                  {documentCameraError}
+                </div>
+              )}
+            </div>
+
+            <div className="document-source-divider">
+              <span>or upload a digital document</span>
+            </div>
+
 <input
   type="password"
   placeholder="Offline e-KYC Share Code (ZIP only)"
@@ -4644,6 +4945,8 @@ export default function Home() {
     setLedgerError('');
     setAnalysisResult(null);
     setSelectedFile(null);
+    stopDocumentCamera();
+    clearDocumentPreview();
     clearSelfie();
 
     if (!file) {
